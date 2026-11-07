@@ -618,8 +618,7 @@ tool_result tool_read_process_output(jdoc *d, jref a)
     if (done && fin)
         sb_printf(&text, "\n✅ Process completed with %s (runtime: %.2fs)", fin, runtime);
 
-    tool_result r = result_text(d, text.p ? text.p : "");
-    sb_free(&text);
+    tool_result r = result_buf(d, &text);
     sb_free(&out);
     return r;
 }
@@ -706,8 +705,7 @@ tool_result tool_interact_with_process(jdoc *d, jref a)
     if (done && fin)
         sb_printf(&text, "\n✅ Process completed with %s (runtime: %.2fs)", fin, runtime);
 
-    tool_result r = result_text(d, text.p ? text.p : "");
-    sb_free(&text);
+    tool_result r = result_buf(d, &text);
     sb_free(&out);
     return r;
 }
@@ -726,8 +724,7 @@ tool_result tool_force_terminate(jdoc *d, jref a)
     sb_init(&note);
     if (!s) {
         sb_printf(&note, "No active session found for PID %d", (int)pid);
-        tool_result r = result_text(d, note.p ? note.p : "");
-        sb_free(&note);
+        tool_result r = result_buf(d, &note);
         return r;
     }
 
@@ -736,8 +733,7 @@ tool_result tool_force_terminate(jdoc *d, jref a)
     pthread_mutex_unlock(&s->lock);
     if (done) {
         sb_printf(&note, "No active session found for PID %d", (int)pid);
-        tool_result r = result_text(d, note.p ? note.p : "");
-        sb_free(&note);
+        tool_result r = result_buf(d, &note);
         return r;
     }
 
@@ -766,8 +762,7 @@ tool_result tool_force_terminate(jdoc *d, jref a)
         close(in_fd);
 
     sb_printf(&note, "Successfully initiated termination of session %d", (int)pid);
-    tool_result r = result_text(d, note.p ? note.p : "");
-    sb_free(&note);
+    tool_result r = result_buf(d, &note);
     return r;
 }
 
@@ -897,8 +892,7 @@ tool_result tool_list_processes(jdoc *d, jref a)
         sb_free(&out);
         return result_text(d, "No processes found.");
     }
-    tool_result r = result_text(d, out.p ? out.p : "");
-    sb_free(&out);
+    tool_result r = result_buf(d, &out);
     return r;
 }
 
@@ -935,7 +929,6 @@ tool_result tool_kill_process(jdoc *d, jref a)
     sbuf b;
     sb_init(&b);
     sb_printf(&b, "Successfully terminated process %d", (int)pid);
-    tool_result r = result_text(d, b.p ? b.p : "");
-    sb_free(&b);
+    tool_result r = result_buf(d, &b);
     return r;
 }

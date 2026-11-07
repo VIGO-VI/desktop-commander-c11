@@ -115,9 +115,8 @@ tool_result tool_get_config(jdoc *d, jref a)
     sbuf b;
     sb_init(&b);
     sb_put(&b, "Current configuration:\n");
-    json_dump_into(&b, d, config_json(d), true);
-    tool_result r = result_text(d, b.p ? b.p : "");
-    sb_free(&b);
+    json_dump_into(&b, d, config_json(d));
+    tool_result r = result_buf(d, &b);
     return r;
 }
 

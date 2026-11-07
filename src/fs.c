@@ -53,6 +53,13 @@ tool_result result_text_struct(jdoc *d, const char *text, jref structured)
     return r;
 }
 
+tool_result result_buf(jdoc *d, sbuf *b)
+{
+    tool_result r = result_text(d, b->p ? b->p : "");
+    sb_free(b);
+    return r;
+}
+
 /* ---------------------------------------------------------------- base64 */
 
 static const char B64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -185,8 +192,7 @@ tool_result tool_read_file(jdoc *d, jref a)
         sb_init(&b);
         sb_put(&b, "This is a directory, not a file. Use list_directory instead.\n\n");
         sb_put(&b, jstr_get(d, jidx(d, listed.content, 0), "text", ""));
-        tool_result r = result_text(d, b.p ? b.p : "");
-        sb_free(&b);
+        tool_result r = result_buf(d, &b);
         free(abs);
         return r;
     }
@@ -256,8 +262,7 @@ tool_result tool_read_file(jdoc *d, jref a)
     }
     sb_put(&b, slice);
 
-    tool_result r = result_text(d, b.p ? b.p : "");
-    sb_free(&b);
+    tool_result r = result_buf(d, &b);
     free(slice);
     free(abs);
     return r;
@@ -464,8 +469,7 @@ tool_result tool_move_file(jdoc *d, jref a)
     sbuf b;
     sb_init(&b);
     sb_printf(&b, "Successfully moved %s to %s", src, dst);
-    tool_result r = result_text(d, b.p ? b.p : "");
-    sb_free(&b);
+    tool_result r = result_buf(d, &b);
     return r;
 }
 
@@ -585,8 +589,7 @@ tool_result tool_list_directory(jdoc *d, jref a)
     } else {
         list_recursive(d, &b, abs, (int)depth, "", true);
     }
-    tool_result r = result_text(d, b.p ? b.p : "");
-    sb_free(&b);
+    tool_result r = result_buf(d, &b);
     free(abs);
     return r;
 }
@@ -645,8 +648,7 @@ tool_result tool_get_file_info(jdoc *d, jref a)
     sb_printf(&b, "permissions: %s\n", perms);
     sb_printf(&b, "fileType: %s", isdir ? "directory" : "text");
 
-    tool_result r = result_text(d, b.p ? b.p : "");
-    sb_free(&b);
+    tool_result r = result_buf(d, &b);
     free(abs);
     return r;
 }

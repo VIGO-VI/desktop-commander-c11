@@ -18,6 +18,8 @@ typedef struct {
 tool_result result_text(jdoc *d, const char *text);
 tool_result result_error(jdoc *d, const char *fmt, ...);
 tool_result result_text_struct(jdoc *d, const char *text, jref structured);
+/* A text result from b, which is freed here. */
+tool_result result_buf(jdoc *d, sbuf *b);
 
 /* Each tool takes the request document and the arguments object (never
  * JNULL) and returns a result in the same document. */

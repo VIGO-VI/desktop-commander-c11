@@ -183,8 +183,7 @@ tool_result tool_edit_block(jdoc *d, jref a)
                       "The closest text is %.0f%% similar, below the 70%% match threshold.",
                       path, score * 100.0);
         }
-        tool_result r = result_text(d, b.p ? b.p : "");
-        sb_free(&b);
+        tool_result r = result_buf(d, &b);
         free(near);
         free(search);
         free(replace);
@@ -245,8 +244,7 @@ tool_result tool_edit_block(jdoc *d, jref a)
                   shown, first, total, remaining);
     sb_put(&b, preview);
 
-    tool_result r = result_text(d, b.p ? b.p : "");
-    sb_free(&b);
+    tool_result r = result_buf(d, &b);
     free(preview);
     free(updated);
     free(search);

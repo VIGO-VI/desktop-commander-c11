@@ -468,8 +468,7 @@ tool_result tool_start_search(jdoc *d, jref a)
     else
         sb_put(&b, "\nSearch completed.");
 
-    tool_result r = result_text(d, b.p ? b.p : "");
-    sb_free(&b);
+    tool_result r = result_buf(d, &b);
     return r;
 }
 
@@ -552,8 +551,7 @@ tool_result tool_get_more_search_results(jdoc *d, jref a)
     }
     pthread_mutex_unlock(&s->lock);
 
-    tool_result r = result_text(d, b.p ? b.p : "");
-    sb_free(&b);
+    tool_result r = result_buf(d, &b);
     return r;
 }
 
@@ -569,8 +567,7 @@ tool_result tool_stop_search(jdoc *d, jref a)
         sbuf b;
         sb_init(&b);
         sb_printf(&b, "Search session %s not found.", id);
-        tool_result r = result_text(d, b.p ? b.p : "");
-        sb_free(&b);
+        tool_result r = result_buf(d, &b);
         return r;
     }
 
@@ -584,8 +581,7 @@ tool_result tool_stop_search(jdoc *d, jref a)
     sb_init(&b);
     sb_printf(&b, "Search session %s %s.", id,
               done ? "already completed" : "terminated successfully");
-    tool_result r = result_text(d, b.p ? b.p : "");
-    sb_free(&b);
+    tool_result r = result_buf(d, &b);
     return r;
 }
 
@@ -619,7 +615,6 @@ tool_result tool_list_searches(jdoc *d, jref a)
     }
     pthread_mutex_unlock(&g_sessions_lock);
 
-    tool_result r = result_text(d, b.p ? b.p : "");
-    sb_free(&b);
+    tool_result r = result_buf(d, &b);
     return r;
 }

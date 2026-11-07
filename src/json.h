@@ -85,6 +85,6 @@ void sb_json_str(sbuf *b, const char *s);
 char *sb_take(sbuf *b);
 
 /* Appends v to b. Nothing allocates per node. */
-void json_dump_into(sbuf *b, const jdoc *d, jref v, bool pretty);
+void json_dump_into(sbuf *b, const jdoc *d, jref v);
 
 #endif

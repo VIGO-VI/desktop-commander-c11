@@ -99,7 +99,7 @@ static void test_dump_roundtrip(void)
 
     sbuf b;
     sb_init(&b);
-    json_dump_into(&b, d, o, false);
+    json_dump_into(&b, d, o);
     CHECK(strcmp(b.p, "{\"name\":\"a \\\"quoted\\\"\\nstring\",\"n\":3,\"list\":[true,null]}")
           == 0);
 

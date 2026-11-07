@@ -33,7 +33,7 @@ for the next one.
 | Measure | This build | The previous build of this rewrite |
 | --- | --- | --- |
 | Binary, default `make`, macOS arm64 | 118 KB | 138 KB |
-| Code section | 39 KB | 51 KB |
+| Code section | 38 KB | 51 KB |
 | Peak RSS, one process that prints 20 MB | 21 MB | 100 MB |
 | Peak RSS, a content search with 50,000 results | 3 MB | 47 MB |
 

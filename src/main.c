@@ -262,14 +262,14 @@ static const tool_def *find_tool(const char *name)
 static void put_envelope(sbuf *out, jdoc *d, jref id)
 {
     sb_put(out, "{\"jsonrpc\":\"2.0\",\"id\":");
-    json_dump_into(out, d, id, false);
+    json_dump_into(out, d, id);
 }
 
 static void reply_result(sbuf *out, jdoc *d, jref id, jref result)
 {
     put_envelope(out, d, id);
     sb_put(out, ",\"result\":");
-    json_dump_into(out, d, result, false);
+    json_dump_into(out, d, result);
     sb_putc(out, '}');
     write_out(out);
 }
