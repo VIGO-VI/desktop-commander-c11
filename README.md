@@ -123,8 +123,9 @@ enable.
 - **Concise messages.** Each tool description is one sentence plus the detail
   a caller needs, not the 40-line prompts of the original. Error and status
   text is shorter; the shapes clients parse are kept.
-- **Linux first.** `list_processes` reads `/proc`. A portable `ps` path exists
-  for other Unix systems. Windows is not supported.
+- **Linux first.** `list_processes` reads `/proc`, the reaper is a child
+  subreaper (`PR_SET_CHILD_SUBREAPER`) and the pipes are `pipe2(O_CLOEXEC)`.
+  A portable `ps` path exists for other Unix systems. Windows is not supported.
 
 ## Layout
 
