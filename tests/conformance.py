@@ -139,24 +139,26 @@ def fixture_tree(root):
 
 
 def rel_paths(text):
-    """Pulls the file paths out of a search answer of either server."""
+    """Pulls the file paths out of a search answer of either server.
+
+    Rows are "path" (files), "path:line - text" (a match) or "path:line . text"
+    (a context line). The markers and the surrounding prose differ, so only a
+    bare path with a known extension counts.
+    """
     out = set()
     for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith(("[", "Pattern", "Path", "Status", "Runtime")):
-            continue
-        if line.startswith(("Started", "Total", "Initial results", "More results",
-                            "Search", "Still", "Stopped", "✅", "📖", "⏱️", "⏹️")):
-            continue
-        for prefix in ("📄 ", "📁 ", "   "):
-            if line.startswith(prefix):
-                line = line[len(prefix) :]
-                break
+        line = line.strip().lstrip("\U0001F4C4\U0001F4C1").strip()
         if " - " in line:
             line = line.split(" - ", 1)[0]
-        if " · " in line:
+        if " \u00b7 " in line:
             continue
-        out.add(os.path.basename(line.split(":")[0]))
+        if not line or " " in line:
+            continue
+        if ":" in line:
+            line = line.split(":", 1)[0]
+        if not (line.endswith(".txt") or line.endswith(".md")):
+            continue
+        out.add(os.path.basename(line))
     return out
 
 
