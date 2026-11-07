@@ -4,7 +4,7 @@ An MCP server for files, searches and long-running terminal sessions. It is a
 rewrite of [DesktopCommanderMCP](https://github.com/wonderwhy-er/DesktopCommanderMCP)
 in C11 for Linux, with no Node.js, no runtime dependencies and no telemetry.
 
-- One static binary, about 65 KB. Only the C library and pthreads.
+- One static binary, about 140 KB. Only the C library and pthreads.
 - Same tool names and arguments as the original, so an existing client works.
 - Same result text and file effects for the tools it covers. The conformance
   test runs both servers side by side and compares them.
