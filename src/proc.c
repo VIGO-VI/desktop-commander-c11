@@ -68,6 +68,12 @@ typedef struct {
     uint64_t partial_shown;    /* length of the tail already returned */
     uint64_t bytes_total;      /* bytes read from the pipe since the start */
 
+    /* A terminal sequence and a carriage return can be split between two
+     * read() calls, so the cleaning state lives in the session. */
+    unsigned char esc;         /* 0 text, 1 after ESC, 2 CSI, 3 OSC/DCS, 4 OSC ESC,
+                                * 5 one byte of a charset designation */
+    bool cr;                   /* a CR waits for the byte after it */
+
     int spool;                 /* file of the whole output, or -1 */
     char spool_path[PATH_MAX];
     uint64_t spool_bytes;
@@ -339,9 +345,11 @@ static void line_push(psess *s, const char *line, size_t len)
     s->lines_total++;
 
     /* A short command leaves no file; a flood gets one that starts at its
-     * first line, because the ring is still small when the cap is passed. */
+     * first line, because the ring is still small when the cap is passed. The
+     * same holds for output that passes the byte cap of an answer: the middle
+     * must stay readable. */
     if (s->spool < 0 && !s->spool_stopped && !s->spool_path[0] &&
-        s->lines_total > spool_after()) {
+        (s->lines_total > spool_after() || s->bytes_total > DCM_OUTPUT_BYTES)) {
         spool_open(s);
     } else {
         spool_append(s, line, len);
@@ -368,6 +376,72 @@ static void push_tail(psess *s)
     s->partial_shown = 0;
 }
 
+/* Reads the stream the way a terminal would and keeps what a caller needs:
+ * no escape sequence, no carriage-return overwrite and no control byte other
+ * than a tab or the newline that ends a line. A colour code, a cursor move and
+ * a progress bar therefore cost the answer nothing, and a command that emits
+ * them still reaches its last line. Caller holds the session lock. */
+static void feed_byte(psess *s, unsigned char c)
+{
+    if (s->esc == 1) {                    /* the byte after ESC */
+        if (c == '[')
+            s->esc = 2;                   /* CSI: parameters and a final byte */
+        else if (c == ']' || c == 'P' || c == '_')
+            s->esc = 3;                   /* OSC, DCS and APC: to BEL or ST */
+        else if (c == '(' || c == ')' || c == '#' || c == '%')
+            s->esc = 5;                   /* a designation of one more byte */
+        else
+            s->esc = 0;                   /* a two-byte sequence */
+        return;
+    }
+    if (s->esc == 2) {
+        if (c >= 0x40 && c <= 0x7E)
+            s->esc = 0;                   /* the final byte of the sequence */
+        return;
+    }
+    if (s->esc == 3) {
+        if (c == 0x07)
+            s->esc = 0;
+        else if (c == 0x1B)
+            s->esc = 4;                   /* ESC \ is the string terminator */
+        return;
+    }
+    if (s->esc == 4) {
+        s->esc = 0;
+        return;
+    }
+    if (s->esc == 5) {
+        s->esc = 0;
+        return;
+    }
+
+    if (s->cr) {
+        s->cr = false;
+        if (c == '\n') {                  /* CRLF ends the line once */
+            push_tail(s);
+            return;
+        }
+        s->plen = 0;                      /* CR returns to the start of the line */
+    }
+    switch (c) {
+    case 0x1B: s->esc = 1; return;
+    case '\r': s->cr = true; return;
+    case '\b': if (s->plen) s->plen--; return;
+    case '\n': push_tail(s); return;
+    case '\t': break;
+    default: if (c < 0x20) return;        /* no other control byte reaches a caller */
+    }
+
+    if (s->plen < sizeof s->partial) {
+        s->partial[s->plen++] = (char)c;
+    } else {
+        /* A line longer than the buffer: flush it as one. */
+        line_push(s, s->partial, s->plen);
+        s->plen = 0;
+        s->partial[s->plen++] = (char)c;
+    }
+}
+
 static void *reader_main(void *arg)
 {
     psess *s = arg;
@@ -385,18 +459,8 @@ static void *reader_main(void *arg)
 
         pthread_mutex_lock(&s->lock);
         s->bytes_total += (uint64_t)n;
-        for (ssize_t i = 0; i < n; i++) {
-            if (buf[i] == '\n') {
-                push_tail(s);
-            } else if (s->plen < sizeof s->partial) {
-                s->partial[s->plen++] = buf[i];
-            } else {
-                /* A line longer than the buffer: flush it as one. */
-                line_push(s, s->partial, s->plen);
-                s->plen = 0;
-                s->partial[s->plen++] = buf[i];
-            }
-        }
+        for (ssize_t i = 0; i < n; i++)
+            feed_byte(s, (unsigned char)buf[i]);
         /* A byte that is not a whole line yet is still progress, and a waiter
          * must see it: a prompt has no newline. */
         pthread_cond_broadcast(&s->cond);
@@ -531,31 +595,124 @@ static void write_page(const psess *s, uint64_t from, uint64_t count, sbuf *out)
     }
 }
 
-/* Head and tail of a page, with one line that says how many lines are left out
- * and where the whole output is. A negative max keeps every line. Returns the
- * number of lines written, the marker line excluded. */
-static uint64_t write_capped(const psess *s, uint64_t from, uint64_t count, int64_t max,
-                             sbuf *out)
+/* The length of line `i`, with *pos at its first byte; *pos moves past the
+ * newline of that line. The unterminated tail is the last visible line.
+ * Caller holds the session lock. */
+static uint64_t next_line_len(const psess *s, uint32_t *pos, uint64_t i, uint64_t complete)
 {
-    if (max < 0 || (uint64_t)max >= count) {
-        write_page(s, from, count, out);
-        return count;
+    if (i >= complete)
+        return s->plen;
+    uint64_t len = 0;
+    while (len < s->bytes && s->buf[*pos] != '\n') {
+        *pos = ring_next(*pos, 1);
+        len++;
     }
-    uint64_t head = (uint64_t)max / 2;
-    uint64_t tail = (uint64_t)max - head;
+    *pos = ring_next(*pos, 1);
+    return len;
+}
+
+/* Bytes of the first n lines of [from, ...), newline included. The
+ * unterminated tail counts as a line. Caller holds the session lock. */
+static uint64_t lines_bytes(const psess *s, uint64_t from, uint64_t n)
+{
+    uint64_t complete = retained_lines(s);
+    uint32_t pos = line_pos(s, from);
+    uint64_t sum = 0;
+    for (uint64_t i = 0; i < n; i++)
+        sum += next_line_len(s, &pos, from + i, complete) + 1;
+    return sum;
+}
+
+/* How many of the n lines of [from, ...) fit in budget bytes, and the bytes
+ * they take. A line that does not fit ends the walk, so a line larger than
+ * the whole budget is left to the output file. */
+static uint64_t lines_fit(const psess *s, uint64_t from, uint64_t n, uint64_t budget,
+                          uint64_t *used)
+{
+    uint64_t complete = retained_lines(s);
+    uint32_t pos = line_pos(s, from);
+    uint64_t sum = 0, fit = 0;
+    while (fit < n) {
+        uint64_t len = next_line_len(s, &pos, from + fit, complete);
+        if (sum + len + 1 > budget)
+            break;
+        sum += len + 1;
+        fit++;
+    }
+    *used = sum;
+    return fit;
+}
+
+/* Lines to drop from the front of [from, from+n) so the rest fits budget, and
+ * the bytes the kept lines take. The last lines carry the error, so they are
+ * the ones the walk keeps. */
+static uint64_t lines_drop(const psess *s, uint64_t from, uint64_t n, uint64_t budget,
+                           uint64_t *used)
+{
+    uint64_t total = lines_bytes(s, from, n);
+    if (total <= budget) {
+        *used = total;
+        return 0;
+    }
+    uint64_t complete = retained_lines(s);
+    uint32_t pos = line_pos(s, from);
+    uint64_t drop = 0;
+    while (drop < n && total > budget) {
+        total -= next_line_len(s, &pos, from + drop, complete) + 1;
+        drop++;
+    }
+    *used = total;
+    return drop;
+}
+
+/* Head and tail of a page, with one line that says how many lines are left out
+ * and where the whole output is. A negative max keeps every line that the byte
+ * cap allows. Returns the number of lines written, the marker line excluded,
+ * and the head count in *head_out. */
+static uint64_t write_capped(const psess *s, uint64_t from, uint64_t count, int64_t max,
+                             sbuf *out, uint64_t *head_out)
+{
+    uint64_t head, tail;
+    if (max < 0 || (uint64_t)max >= count) {
+        head = count;
+        tail = 0;
+    } else {
+        head = (uint64_t)max / 2;
+        tail = (uint64_t)max - head;
+    }
+
+    uint64_t hb = lines_bytes(s, from, head);
+    uint64_t tb = tail ? lines_bytes(s, from + count - tail, tail) : 0;
+    if (DCM_OUTPUT_BYTES > 0 && hb + tb > DCM_OUTPUT_BYTES) {
+        if (tail == 0) {
+            /* The line cap kept everything, and the byte cap keeps both ends:
+             * a single long line must not spend the whole answer. */
+            head = count / 2;
+            tail = count - head;
+        }
+        /* A quarter of the answer is the start, the rest is the end. Whole
+         * lines only, so the answer never stops in the middle of a line. */
+        head = lines_fit(s, from, head, DCM_OUTPUT_BYTES / 4, &hb);
+        tail -= lines_drop(s, from + count - tail, tail,
+                           DCM_OUTPUT_BYTES - DCM_OUTPUT_BYTES / 4, &tb);
+    }
+
+    *head_out = head;
     uint64_t omitted = count - head - tail;
     if (head)
         write_page(s, from, head, out);
-    sb_printf(out, "[... %llu of %llu lines omitted",
-              (unsigned long long)omitted, (unsigned long long)count);
-    if (s->spool_path[0]) {
-        if (s->spool_stopped)
-            sb_printf(out, "; the output up to the file cap of %u bytes is in %s",
-                      (unsigned)DCM_SPOOL_BYTES, s->spool_path);
-        else
-            sb_printf(out, "; the whole output is in %s", s->spool_path);
+    if (omitted) {
+        sb_printf(out, "[... %llu of %llu lines omitted",
+                  (unsigned long long)omitted, (unsigned long long)count);
+        if (s->spool_path[0]) {
+            if (s->spool_stopped)
+                sb_printf(out, "; the output up to the file cap of %u bytes is in %s",
+                          (unsigned)DCM_SPOOL_BYTES, s->spool_path);
+            else
+                sb_printf(out, "; the whole output is in %s", s->spool_path);
+        }
+        sb_put(out, " ...]\n");
     }
-    sb_put(out, " ...]\n");
     if (tail)
         write_page(s, from + count - tail, tail, out);
     return head + tail;
@@ -793,6 +950,8 @@ tool_result tool_start_process(jdoc *d, jref a)
             s->plen = 0;
             s->partial_shown = 0;
             s->bytes_total = 0;
+            s->esc = 0;
+            s->cr = false;
             spool_reset(s);
             pthread_mutex_unlock(&s->lock);
         }
@@ -854,18 +1013,16 @@ tool_result tool_start_process(jdoc *d, jref a)
 
     sbuf out;
     sb_init(&out);
-    uint64_t shown = write_capped(s, 0, total, max_lines, &out);
+    uint64_t head_shown = 0;
+    uint64_t shown = write_capped(s, 0, total, max_lines, &out, &head_shown);
 
     /* A page that holds everything moves the unread pointer; a capped one
      * moves it past the head, so the next read continues in the middle. */
-    uint64_t head = (max_lines >= 0 && total > (uint64_t)max_lines)
-                        ? (uint64_t)max_lines / 2
-                        : total;
-    if (head == total) {
+    if (shown == total) {
         s->unread = s->lines_total;
         s->partial_shown = s->plen;
     } else {
-        s->unread = s->lines_evicted + head;
+        s->unread = s->lines_evicted + head_shown;
     }
 
     char ending[128];
@@ -1073,14 +1230,15 @@ tool_result tool_interact_with_process(jdoc *d, jref a)
         count = total - from;
     if (max_lines >= 0 && count > (uint64_t)max_lines)
         spool_open(s);
-    uint64_t shown = write_capped(s, from, count, max_lines, &out);
+    uint64_t head_shown = 0;
+    uint64_t shown = write_capped(s, from, count, max_lines, &out, &head_shown);
     /* Move the unread pointer past what the answer holds. A capped answer
      * moves it past the head only, so the middle is still readable. */
     if (shown == count) {
         s->unread = s->lines_total;
         s->partial_shown = s->plen;
     } else {
-        s->unread = s->lines_evicted + from + (uint64_t)max_lines / 2;
+        s->unread = s->lines_evicted + from + head_shown;
     }
     bool done = settle_done(s, 50);
     char ending[128];

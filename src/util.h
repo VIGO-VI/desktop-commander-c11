@@ -22,6 +22,7 @@ typedef struct {
     int64_t read_line_limit;  /* fileReadLineLimit */
     int64_t write_line_limit; /* fileWriteLineLimit */
     int64_t output_lines;     /* maxOutputLines of a process answer */
+    int64_t output_bytes;     /* maxOutputBytes of a process answer */
 } config;
 
 const config *cfg(void);

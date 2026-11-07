@@ -38,6 +38,14 @@
  * max_output_lines; a negative value returns every line. */
 #define DCM_OUTPUT_LINES 200
 
+/* Bytes of process output that one answer returns at most, newlines included.
+ * The line cap alone cannot bound an answer: one command may print a few very
+ * long lines. The head gets a quarter of this and the tail the rest, and whole
+ * lines only. The rest stays readable in the session's output file, which a
+ * session opens as soon as its output passes this number of bytes. A build with
+ * 0 removes the cap. */
+#define DCM_OUTPUT_BYTES 32768
+
 /* Requests accepted before the reader waits: three agents of ten calls each,
  * plus a little. A request beyond this waits for a slot. */
 #define DCM_MAX_INFLIGHT 32

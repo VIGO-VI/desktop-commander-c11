@@ -81,6 +81,18 @@ on 8 worker threads (`DCM_WORKERS`), so the calls of two or three agents do not
 queue behind a command that waits on a prompt. Each worker keeps its JSON
 document and its output buffer between requests.
 
+A process answer is cleaned the way a terminal would clean it. Colour codes,
+cursor moves, an OSC title, a CR overwrite and a backspace are applied or
+dropped as they arrive, so a command that draws a progress bar costs one line
+and not a stream of escape sequences. A byte that is not valid UTF-8 becomes
+U+FFFD, because a JSON string must be valid UTF-8 for the client to parse the
+line at all.
+
+An answer is bounded by bytes as well as by lines. `DCM_OUTPUT_BYTES` (32 KB)
+keeps a quarter of the output from the start and the rest from the end, whole
+lines only, and the rest is in the file. One command that printed a single
+5 MB line returned under 20 KB, and the file held all 5,000,000 bytes.
+
 ## Build and test
 
 ```sh
@@ -164,6 +176,7 @@ keeps its own values while the defaults stay in the tree.
 | `DCM_READ_LINE_LIMIT` | `1000` | Default `length` for `read_file`. |
 | `DCM_WRITE_LINE_LIMIT` | `50` | Warning threshold for `edit_block`. |
 | `DCM_OUTPUT_LINES` | `200` | Lines a process answer returns, half head and half tail. |
+| `DCM_OUTPUT_BYTES` | `32768` | Bytes a process answer returns, a quarter head and the rest tail. |
 | `DCM_MAX_INFLIGHT` | `32` | Requests accepted before the reader waits. |
 | `DCM_WORKERS` | `8` | Threads that run them. |
 | `DCM_MAX_SESSIONS` | `32` | Process sessions at once. |
