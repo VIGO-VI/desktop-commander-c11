@@ -131,11 +131,53 @@ char *sb_take(sbuf *b)
     return p;
 }
 
+/* Length of the UTF-8 sequence at p, or 0 when the bytes there are not one.
+ * Overlong forms, surrogates and code points above U+10FFFF are invalid, so a
+ * string that this accepts is what RFC 8259 asks of a JSON text. */
+static size_t utf8_seq(const unsigned char *p, size_t n)
+{
+    unsigned char c = p[0];
+    if (c < 0x80)
+        return 1;
+    if (c < 0xC2)
+        return 0;
+    if (c < 0xE0) {
+        if (n < 2 || (p[1] & 0xC0) != 0x80)
+            return 0;
+        return 2;
+    }
+    if (c < 0xF0) {
+        if (n < 3 || (p[1] & 0xC0) != 0x80 || (p[2] & 0xC0) != 0x80)
+            return 0;
+        if (c == 0xE0 && p[1] < 0xA0)
+            return 0;
+        if (c == 0xED && p[1] > 0x9F)
+            return 0;
+        return 3;
+    }
+    if (c < 0xF5) {
+        if (n < 4 || (p[1] & 0xC0) != 0x80 || (p[2] & 0xC0) != 0x80 ||
+            (p[3] & 0xC0) != 0x80)
+            return 0;
+        if (c == 0xF0 && p[1] < 0x90)
+            return 0;
+        if (c == 0xF4 && p[1] > 0x8F)
+            return 0;
+        return 4;
+    }
+    return 0;
+}
+
+/* A string of the answer. Every byte that is not valid UTF-8 becomes U+FFFD,
+ * so a file or a process that prints a byte from another encoding still
+ * yields a line the client can parse. */
 void sb_json_str(sbuf *b, const char *s)
 {
     sb_putc(b, '"');
-    for (const unsigned char *p = (const unsigned char *)s; s && *p; p++) {
-        switch (*p) {
+    size_t n = s ? strlen(s) : 0;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        switch (c) {
         case '"': sb_put(b, "\\\""); break;
         case '\\': sb_put(b, "\\\\"); break;
         case '\n': sb_put(b, "\\n"); break;
@@ -144,10 +186,19 @@ void sb_json_str(sbuf *b, const char *s)
         case '\b': sb_put(b, "\\b"); break;
         case '\f': sb_put(b, "\\f"); break;
         default:
-            if (*p < 0x20)
-                sb_printf(b, "\\u%04x", (unsigned)*p);
-            else
-                sb_putc(b, (char)*p);
+            if (c < 0x20) {
+                sb_printf(b, "\\u%04x", (unsigned)c);
+            } else if (c < 0x80) {
+                sb_putc(b, (char)c);
+            } else {
+                size_t len = utf8_seq((const unsigned char *)s + i, n - i);
+                if (len) {
+                    sb_putn(b, s + i, len);
+                    i += len - 1;
+                } else {
+                    sb_put(b, "\\ufffd");
+                }
+            }
         }
     }
     sb_putc(b, '"');

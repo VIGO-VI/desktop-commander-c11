@@ -37,8 +37,8 @@ typedef struct {
 static const tool_def TOOLS[] = {
     { "get_config", "Get Configuration",
       "Get the build configuration: blockedCommands, defaultShell, "
-      "allowedDirectories, fileReadLineLimit, fileWriteLineLimit, maxOutputLines, version, "
-      "systemInfo.",
+      "allowedDirectories, fileReadLineLimit, fileWriteLineLimit, maxOutputLines, "
+      "maxOutputBytes, version, systemInfo.",
       "{\"type\":\"object\",\"properties\":{}}", tool_get_config, true, false, false },
 
     { "set_config_value", "Set Configuration Value",
@@ -161,7 +161,8 @@ static const tool_def TOOLS[] = {
     { "start_process", "Start Process",
       "Run a shell command and wait up to timeout_ms for output. A command still running "
       "returns a PID for read_process_output and interact_with_process. The answer keeps the "
-      "first and last max_output_lines lines; the whole output is in the file it names.",
+      "first and last max_output_lines lines, and at most maxOutputBytes bytes; the whole "
+      "output is in the file it names.",
       "{\"type\":\"object\",\"properties\":{"
       "\"command\":{\"type\":\"string\"},"
       "\"timeout_ms\":{\"type\":\"number\"},"

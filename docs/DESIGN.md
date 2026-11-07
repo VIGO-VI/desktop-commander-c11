@@ -44,11 +44,28 @@ On Linux the pipes are `pipe2(O_CLOEXEC)` and the reaper sets
 
 The reader drains the pipe until the process ends, whatever the answer keeps.
 An answer holds `max_output_lines` lines at most: half from the head, half from
-the tail, and one line that says how many were left out. When the output passes
-the default cap the reader opens a file and writes the whole stream to it, from
-the first line, so the middle is one `read_file` away. A cap that closed the
-read end would kill a command that prints more with SIGPIPE, and the reader
-never closes it early.
+the tail, and one line that says how many were left out. It also holds
+`DCM_OUTPUT_BYTES` bytes at most, because a few very long lines pass the line
+cap: a quarter of the budget is the head and the rest is the tail, whole lines
+only. When the output passes either cap the reader opens a file and writes the
+whole stream to it, from the first line, so the middle is one `read_file` away.
+A cap that closed the read end would kill a command that prints more with
+SIGPIPE, and the reader never closes it early.
+
+The reader also cleans the stream before it reaches the ring, so the answer and
+the file hold the same text. It reads escape sequences the way a terminal does:
+CSI ends at its final byte, an OSC or DCS string ends at BEL or `ESC \`, and a
+designation takes one more byte. `\r` returns to the start of the line and the
+text after it replaces what came before, `\b` removes a character, and a CRLF
+ends the line once. Other control bytes are dropped. The state lives in the
+session, because a sequence or a carriage return can be split between two
+reads.
+
+A JSON string must be valid UTF-8, and a process is free to print a byte of
+another encoding. `sb_json_str` checks each sequence and writes U+FFFD for a
+byte that is not valid UTF-8, including an overlong form, a surrogate and a
+sequence cut at the end of the string. A client therefore always parses the
+line.
 
 A wait is a condition variable on the monotonic clock, so a change of the wall
 clock neither stretches nor cuts it. The reader broadcasts on every read, not

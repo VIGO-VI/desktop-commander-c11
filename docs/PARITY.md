@@ -27,7 +27,7 @@ Everything else keeps its name, its arguments and the shape of its answer.
 | `get_more_search_results` | same | `offset`/`length` paging. |
 | `stop_search` | same | |
 | `list_searches` | same | |
-| `start_process` | same, plus a cap | Shell session, `timeout_ms` wait, `structuredContent.pid`. `max_output_lines` keeps the head and the tail, and the whole output is in the file the answer names. The reader drains the pipe to the end of the process, so a capped answer does not kill the command. |
+| `start_process` | same, plus a cap | Shell session, `timeout_ms` wait, `structuredContent.pid`. `max_output_lines` keeps the head and the tail, and `maxOutputBytes` bounds the bytes; the whole output is in the file the answer names. The reader drains the pipe to the end of the process, so a capped answer does not kill the command. |
 | `read_process_output` | same, plus a wait that ends on a prompt | `offset` 0 = new lines, positive = absolute, negative = tail. A line with no newline yet ends the wait too. |
 | `interact_with_process` | same | Writes the input with a newline and returns the new output. |
 | `force_terminate` | same | Signals the whole session group, then SIGKILL. |
@@ -51,10 +51,15 @@ Everything else keeps its name, its arguments and the shape of its answer.
 - A process session keeps 4 MB of output and a search keeps 8192 rows. Both
   numbers are in `src/config.h`; the original grows until the machine stops.
 - A process answer keeps `DCM_OUTPUT_LINES` (200) lines by default: the head
-  and the tail, and the whole output is in a file the answer names. The
-  original has no output file, so what its answer leaves out is gone. A call
-  passes `max_output_lines` to change the count, and a negative value keeps all
-  of it.
+  and the tail, and the whole output is in a file the answer names. It also
+  keeps at most `DCM_OUTPUT_BYTES` (32 KB), because a few very long lines can
+  pass the line cap. The original has no output file, so what its answer
+  leaves out is gone. A call passes `max_output_lines` to change the count, and
+  a negative value keeps every line that the byte cap allows.
+- A process answer is cleaned of terminal control: colour codes and cursor
+  moves are dropped, a CR overwrite and a backspace are applied, and a byte
+  that is not valid UTF-8 becomes U+FFFD. The original returns the escape
+  sequences and can emit a JSON line that a strict client rejects.
 - The configuration is not read from or written to `config.json`. A client that
   sets a value gets the error that names the header.
 - The server runs tool calls on 8 worker threads and takes 32 requests at once,

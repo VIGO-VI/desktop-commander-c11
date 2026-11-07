@@ -199,6 +199,34 @@ static void test_sbuf(void)
     sb_free(&b);
 }
 
+/* An answer is a JSON text, so its strings are valid UTF-8. A byte of another
+ * encoding becomes U+FFFD instead of a line that a client cannot parse. */
+static void test_json_escape_utf8(void)
+{
+    sbuf b;
+    sb_init(&b);
+    sb_json_str(&b, "a\xC3\xA9\xE2\x82\xAC\xF0\x9F\x98\x80");
+    CHECK(strcmp(b.p, "\"a\xC3\xA9\xE2\x82\xAC\xF0\x9F\x98\x80\"") == 0);
+    sb_reset(&b);
+    sb_json_str(&b, "a\xFFz");
+    CHECK(strcmp(b.p, "\"a\\ufffdz\"") == 0);
+    /* Overlong, surrogate and above U+10FFFF are not valid UTF-8. */
+    sb_reset(&b);
+    sb_json_str(&b, "\xC0\x80");
+    CHECK(strcmp(b.p, "\"\\ufffd\\ufffd\"") == 0);
+    sb_reset(&b);
+    sb_json_str(&b, "\xED\xA0\x80");
+    CHECK(strcmp(b.p, "\"\\ufffd\\ufffd\\ufffd\"") == 0);
+    sb_reset(&b);
+    sb_json_str(&b, "\xF5\x80\x80\x80");
+    CHECK(strcmp(b.p, "\"\\ufffd\\ufffd\\ufffd\\ufffd\"") == 0);
+    /* A sequence cut at the end of the string is incomplete. */
+    sb_reset(&b);
+    sb_json_str(&b, "\xE2\x82");
+    CHECK(strcmp(b.p, "\"\\ufffd\\ufffd\"") == 0);
+    sb_free(&b);
+}
+
 int main(void)
 {
     test_parse_scalars();
@@ -211,6 +239,7 @@ int main(void)
     test_big_string();
     test_reset();
     test_sbuf();
+    test_json_escape_utf8();
     if (failures) {
         fprintf(stderr, "%d json test(s) failed\n", failures);
         return 1;

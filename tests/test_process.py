@@ -197,6 +197,97 @@ def check_prompt_wait(server, failures):
     server.tool("force_terminate", {"pid": pid})
 
 
+def check_output_clean(server, failures):
+    """A colour code, an OSC title and a CR overwrite never reach the answer,
+    and the output file holds the same cleaned text."""
+    text, st, err = server.tool(
+        "start_process",
+        {"command": "printf 'red\\033[31mX\\033[0m\\naaa\\rbbb\\n\\033]0;t\\007ok\\n'",
+         "timeout_ms": 5000})
+    if err:
+        failures.append(f"clean start failed: {text[:200]}")
+        return
+    if "\x1b" in text:
+        failures.append("an escape sequence reached the answer")
+    for want in ("redX", "bbb", "ok"):
+        if want not in text:
+            failures.append(f"the answer lost {want!r}: {text[:200]}")
+    if "aaa" in text:
+        failures.append("the text a CR overwrites reached the answer")
+    path = st.get("outputFile", "")
+    if path and os.path.exists(path):
+        with open(path, "r", errors="replace") as f:
+            whole = f.read()
+        if "\x1b" in whole or "redX" not in whole or "aaa" in whole:
+            failures.append("the output file was not cleaned the same way")
+    # A sequence split between two reads is still one sequence.
+    text, st, err = server.tool(
+        "start_process",
+        {"command": "printf '\\033['; sleep 0.2; printf '31mred\\033[0m\\n'",
+         "timeout_ms": 2000})
+    if err or "\x1b" in text or "red" not in text:
+        failures.append(f"a split escape sequence was not cleaned: {text[-120:]!r}")
+
+
+def check_output_bytes(server, failures):
+    """One long line does not spend the whole answer, and the file keeps it."""
+    text, st, err = server.tool(
+        "start_process",
+        {"command": "head -c 5000000 /dev/zero | tr '\\0' a; echo", "timeout_ms": 20000})
+    if err:
+        failures.append(f"long line start failed: {text[:200]}")
+        return
+    if len(text) > 40000:
+        failures.append(f"a 5 MB line returned {len(text)} bytes")
+    path = st.get("outputFile", "")
+    if not path or not os.path.exists(path):
+        failures.append("a long line wrote no output file")
+    elif os.path.getsize(path) < 5000000:
+        failures.append(f"the output file holds {os.path.getsize(path)} bytes, expected 5000000")
+    if not ELISION.search(text):
+        failures.append("the byte cap left no elision line: " + text[:200])
+    # A page that the line cap keeps is still cut by bytes, head and tail.
+    text, st, err = server.tool("start_process",
+                                {"command": "seq 1 20000", "timeout_ms": 20000,
+                                 "max_output_lines": -1})
+    if err or len(text) > 40000:
+        failures.append(f"max_output_lines -1 returned {len(text)} bytes")
+    elif "1\n" not in text or "20000" not in text:
+        failures.append("the byte cap did not keep both ends of the output")
+    elif st.get("shownLines", 0) >= st.get("outputLines", 0):
+        failures.append(f"the byte cap kept every line: {st}")
+
+
+def check_invalid_utf8(binary, failures):
+    """A byte from another encoding becomes U+FFFD, not an unparsable line."""
+    proc = subprocess.Popen([binary], stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    try:
+        def rpc(i, method, params):
+            msg = {"jsonrpc": "2.0", "id": i, "method": method, "params": params}
+            proc.stdin.write(json.dumps(msg).encode() + b"\n")
+            proc.stdin.flush()
+            return proc.stdout.readline()
+
+        rpc(1, "initialize", {"protocolVersion": "2024-11-05"})
+        proc.stdin.write(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
+        proc.stdin.flush()
+        line = rpc(2, "tools/call",
+                   {"name": "start_process",
+                    "arguments": {"command": "printf 'ok\\377done\\n'", "timeout_ms": 5000}})
+    finally:
+        proc.stdin.close()
+        proc.wait(timeout=10)
+    try:
+        msg = json.loads(line)  # decodes the line as UTF-8, strictly
+    except Exception as e:
+        failures.append(f"the answer is not valid UTF-8: {e}")
+        return
+    text = "\n".join(b.get("text", "") for b in msg["result"]["content"])
+    if "\ufffd" not in text or "ok" not in text or "done" not in text:
+        failures.append("the invalid byte did not become U+FFFD: " + repr(text[:200]))
+
+
 def main():
     binary = sys.argv[1] if len(sys.argv) > 1 else "./dcm"
     server = Server(binary)
@@ -207,6 +298,9 @@ def main():
         check_cap_argument(server, failures)
         check_partial_wait(server, failures)
         check_prompt_wait(server, failures)
+        check_output_clean(server, failures)
+        check_output_bytes(server, failures)
+        check_invalid_utf8(binary, failures)
     finally:
         server.close()
 
