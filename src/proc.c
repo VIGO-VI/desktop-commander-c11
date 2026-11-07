@@ -707,11 +707,13 @@ tool_result tool_list_sessions(json *a)
 
 /* ---------------------------------------------------------------- ps */
 
+#ifndef __linux__
 static void ps_line(const char *pid, const char *comm, const char *cpu,
                     const char *mem, sbuf *out)
 {
     sb_printf(out, "PID: %s, Command: %s, CPU: %s, Memory: %s\n", pid, comm, cpu, mem);
 }
+#endif
 
 tool_result tool_list_processes(json *a)
 {
