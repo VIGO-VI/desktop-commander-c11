@@ -159,7 +159,7 @@ keeps its own values while the defaults stay in the tree.
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `DCM_ALLOWED_DIRECTORIES` | none | Roots a path must be under. Empty allows the whole file system. |
-| `DCM_BLOCKED_COMMANDS` | the original's list | First words that `start_process` refuses. |
+| `DCM_BLOCKED_COMMANDS` | the original's list | First words that `start_process` refuses. A line is split at an unquoted `;`, `|`, `&`, newline, backtick or parenthesis, and each first word is checked. It is a guard, not a sandbox. |
 | `DCM_DEFAULT_SHELL` | `""` | Shell for `start_process`; empty takes `$SHELL`, then `/bin/bash`. |
 | `DCM_READ_LINE_LIMIT` | `1000` | Default `length` for `read_file`. |
 | `DCM_WRITE_LINE_LIMIT` | `50` | Warning threshold for `edit_block`. |

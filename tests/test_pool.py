@@ -83,6 +83,20 @@ def main():
         ids = {read_one(proc, timeout=30).get("id") for _ in range(len(batch))}
         if ids != {4000 + i for i in range(len(batch))}:
             failures.append("a batch of 32 concurrent calls lost an answer")
+
+        # A finished session gives its slot back. More short processes than
+        # there are slots must all start, one after another.
+        time.sleep(0.5)
+        reused = 0
+        for i in range(36):
+            send(proc, [call(5000 + i, "start_process",
+                             {"command": "true", "timeout_ms": 500})])
+            msg = read_one(proc, timeout=30)
+            text = "".join(b.get("text", "") for b in msg.get("result", {}).get("content", []))
+            if "No free process session" in text:
+                reused += 1
+        if reused:
+            failures.append(f"{reused} short processes could not take a finished slot")
     finally:
         proc.stdin.close()
         proc.wait(timeout=30)

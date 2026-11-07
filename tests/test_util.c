@@ -65,10 +65,14 @@ static void test_blocklist(void)
     CHECK(command_is_blocked("echo $(dd if=x)"));
     CHECK(command_is_blocked("'sudo' --version"));
     CHECK(command_is_blocked("SUDO ls"));
+    /* The shell starts a new command at a newline, as it does at `;`. */
+    CHECK(command_is_blocked("echo hi\nsudo ls"));
+    CHECK(command_is_blocked("true\nmount /dev/sda1 /mnt"));
     CHECK(!command_is_blocked("echo sudo"));
     CHECK(!command_is_blocked("ls -la"));
     CHECK(!command_is_blocked("echo \"a; sudo b\""));
     CHECK(!command_is_blocked("echo \\; sudo"));
+    CHECK(!command_is_blocked("echo 'a\nsudo b'"));
 }
 
 static void test_paths(void)

@@ -59,6 +59,12 @@ back only when it grew, so a one-line progress bar does not spin the caller.
 The answer of a call moves the unread pointer only past the lines it holds, so
 a capped start does not hide the middle from the next read.
 
+`start_process` first checks the blocklist. It compares the first word of each
+command in the line, and it splits at an unquoted `;`, `|`, `&`, newline,
+backtick or parenthesis, with one pair of quotes removed. This is a guard
+against a mistake, not a sandbox: a shell keyword or an assignment before a
+command hides the name, and `start_process` runs the shell it was given.
+
 `list_processes` reads `/proc` directly on Linux: it is the kernel's table and
 needs no fork. Other Unix systems fall back to `ps`.
 
@@ -77,8 +83,10 @@ steady traffic allocates once per worker. A string handle is 4 bytes and never
 zero, so an absent key and the empty string are different.
 
 Sessions are slots of static arrays: `g_procs[DCM_MAX_SESSIONS]` and
-`g_searches[DCM_MAX_SEARCHES]`. A slot is reused when its thread has left, and
-the count of sessions is what bounds the memory.
+`g_searches[DCM_MAX_SEARCHES]`. A process slot is reused only when its reader
+has left and its child was collected, because the reader can still add lines
+after the child exits. The output of a slot that is not finished stays where a
+client can read it, and the count of sessions is what bounds the memory.
 
 A process session keeps its output in a byte ring of `DCM_SESSION_BYTES`
 (4 MB). A new line goes into the free space and the oldest whole lines are
