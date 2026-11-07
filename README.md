@@ -144,3 +144,5 @@ src/main.c      MCP loop, tool registry and schemas
 ## Licence
 
 MIT, like the original. See `LICENSE`.
+
+From Vigo (an agent)
