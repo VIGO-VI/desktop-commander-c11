@@ -21,7 +21,7 @@ void *xmalloc(size_t n)
     void *p = malloc(n ? n : 1);
     if (!p) {
         fputs("dcm: out of memory\n", stderr);
-        exit(2);
+        abort();
     }
     return p;
 }
@@ -31,7 +31,7 @@ void *xrealloc(void *p, size_t n)
     void *q = realloc(p, n ? n : 1);
     if (!q) {
         fputs("dcm: out of memory\n", stderr);
-        exit(2);
+        abort();
     }
     return q;
 }
@@ -40,23 +40,25 @@ char *xstrdup(const char *s)
 {
     size_t n = strlen(s ? s : "") + 1;
     char *p = xmalloc(n);
-    if (s)
-        memcpy(p, s, n);
-    else
-        p[0] = '\0';
+    memcpy(p, s ? s : "", n);
     return p;
 }
 
 char *xasprintf(const char *fmt, ...)
 {
     va_list ap, ap2;
+    char tmp[512];
     va_start(ap, fmt);
     va_copy(ap2, ap);
-    int need = vsnprintf(NULL, 0, fmt, ap);
+    int need = vsnprintf(tmp, sizeof tmp, fmt, ap);
     va_end(ap);
     if (need < 0) {
         va_end(ap2);
         return xstrdup("");
+    }
+    if ((size_t)need < sizeof tmp) {
+        va_end(ap2);
+        return xstrdup(tmp);
     }
     char *p = xmalloc((size_t)need + 1);
     vsnprintf(p, (size_t)need + 1, fmt, ap2);
@@ -67,27 +69,14 @@ char *xasprintf(const char *fmt, ...)
 const char *dcm_home_dir(void)
 {
     const char *h = getenv("HOME");
-    return h && *h ? h : "/";
+    return (h && *h) ? h : "/";
 }
 
-const char *dcm_config_dir(void)
-{
-    static char *dir;
-    if (dir)
-        return dir;
-    const char *xdg = getenv("XDG_CONFIG_HOME");
-    if (xdg && *xdg)
-        dir = xasprintf("%s/desktop-commander", xdg);
-    else
-        dir = xasprintf("%s/.config/desktop-commander", dcm_home_dir());
-    return dir;
-}
-
-long long now_ms(void)
+int64_t now_ms(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
-    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
 /* ---------------------------------------------------------------- paths */
@@ -155,27 +144,18 @@ char *validate_path(const char *path, char **out)
         return xstrdup("Path is empty");
 
     char *abs = path_absolute(path);
-    config *cfg = config_load();
+    const config *c = cfg();
 
     /* A missing path cannot be symlink-checked; realpath of the parent is
      * inside path_absolute, so an escaping symlink still shows up here. */
     char *real = realpath(abs, NULL);
-    char *check = real ? real : abs;
+    const char *check = real ? real : abs;
 
-    if (cfg->nallowed > 0) {
+    if (c->nallowed > 0) {
         bool ok = false;
-        for (size_t i = 0; i < cfg->nallowed; i++) {
-            char *root = realpath(cfg->allowed[i], NULL);
-            if (!root)
-                continue;
-            if (path_under(check, root))
-                ok = true;
-            free(root);
-            if (ok)
-                break;
-        }
+        for (size_t i = 0; i < c->nallowed && !ok; i++)
+            ok = path_under(check, c->allowed[i]);
         if (!ok) {
-            config_free(cfg);
             char *msg = xasprintf("Access denied: path is outside allowedDirectories: %s", path);
             free(real);
             free(abs);
@@ -183,7 +163,6 @@ char *validate_path(const char *path, char **out)
         }
     }
 
-    config_free(cfg);
     free(real);
     *out = abs;
     return NULL;
@@ -302,17 +281,16 @@ const char *mime_type_for(const char *path)
 bool file_is_image(const char *path)
 {
     const char *m = mime_type_for(path);
-    return strncmp(m, "image/", 6) == 0 && !str_ieq(strrchr(path, '.') ? strrchr(path, '.') : "", ".svg");
+    const char *dot = strrchr(path, '.');
+    return strncmp(m, "image/", 6) == 0 && !(dot && str_ieq(dot, ".svg"));
 }
 
 bool data_is_binary(const char *data, size_t len)
 {
     size_t check = len < 8000 ? len : 8000;
-    for (size_t i = 0; i < check; i++) {
-        unsigned char c = (unsigned char)data[i];
-        if (c == 0)
+    for (size_t i = 0; i < check; i++)
+        if (data[i] == '\0')
             return true;
-    }
     return false;
 }
 
@@ -393,9 +371,10 @@ char *dir_name(const char *path)
         return xstrdup(".");
     if (slash == path)
         return xstrdup("/");
-    char *out = xmalloc((size_t)(slash - path) + 1);
-    memcpy(out, path, (size_t)(slash - path));
-    out[slash - path] = '\0';
+    size_t n = (size_t)(slash - path);
+    char *out = xmalloc(n + 1);
+    memcpy(out, path, n);
+    out[n] = '\0';
     return out;
 }
 
@@ -425,101 +404,58 @@ bool str_starts(const char *s, const char *prefix)
 
 /* ---------------------------------------------------------------- blocklist */
 
-/* Split a command line at unquoted ; && || | & and inside $( ) and ` `.
- * Each element is the first word of one command. */
-char **command_split(const char *cmd, size_t *n_out)
+/* True when the first word of a command in the line is in the blocklist.
+ * One pass, no allocation: the line is split at unquoted separators, and each
+ * first word is compared where it lies. */
+bool command_is_blocked(const char *cmd)
 {
-    char **out = NULL;
-    size_t n = 0, cap = 0;
+    const config *c = cfg();
+    if (c->nblocked == 0)
+        return false;
 
-    sbuf cur;
-    sb_init(&cur);
     bool in_single = false, in_double = false, escaped = false;
+    size_t start = 0, len = strlen(cmd);
 
-    size_t len = strlen(cmd);
     for (size_t i = 0; i <= len; i++) {
-        char c = i < len ? cmd[i] : '\0';
+        char ch = i < len ? cmd[i] : '\0';
         bool sep = false;
-        if (!in_single && !in_double && !escaped) {
-            if (c == '\0' || c == ';' || c == '|' || c == '&' || c == '`' ||
-                c == '(' || c == ')')
-                sep = true;
-        }
         if (escaped) {
             escaped = false;
-            sb_putc(&cur, c);
-            continue;
-        }
-        if (c == '\\' && !in_single) {
+        } else if (ch == '\\' && !in_single) {
             escaped = true;
-            sb_putc(&cur, c);
-            continue;
-        }
-        if (c == '\'' && !in_double) {
+        } else if (ch == '\'' && !in_double) {
             in_single = !in_single;
-            sb_putc(&cur, c);
-            continue;
-        }
-        if (c == '"' && !in_single) {
+        } else if (ch == '"' && !in_single) {
             in_double = !in_double;
-            sb_putc(&cur, c);
+        } else if (!in_single && !in_double &&
+                   (ch == '\0' || ch == ';' || ch == '|' || ch == '&' || ch == '`' ||
+                    ch == '(' || ch == ')')) {
+            sep = true;
+        }
+        if (!sep)
             continue;
-        }
-        if (sep) {
-            if (cur.n) {
-                char *s = sb_take(&cur);
-                if (n == cap) {
-                    cap = cap ? cap * 2 : 8;
-                    out = xrealloc(out, cap * sizeof *out);
-                }
-                out[n++] = s;
-            }
-            if (c == '\0')
-                break;
-            continue;
-        }
-        sb_putc(&cur, c);
-    }
-    sb_free(&cur);
 
-    /* Keep the first word of each command, unquoted, lowercased. The word
-     * moves to the base of its buffer so it can be freed by that base. */
-    for (size_t i = 0; i < n; i++) {
-        char *s = out[i];
-        char *w = s;
-        while (*w == ' ' || *w == '\t')
-            w++;
-        size_t wlen = 0;
-        while (w[wlen] && w[wlen] != ' ' && w[wlen] != '\t')
-            wlen++;
-        /* Surrounding quotes belong to the shell, not the name. */
-        if (wlen >= 2 && ((w[0] == '"' && w[wlen - 1] == '"') ||
-                          (w[0] == '\'' && w[wlen - 1] == '\''))) {
-            w++;
-            wlen -= 2;
+        /* One command: cmd[start..i). Its first word, quotes removed. */
+        const char *p = cmd + start;
+        size_t n = i - start;
+        while (n && (*p == ' ' || *p == '\t')) {
+            p++;
+            n--;
         }
-        memmove(s, w, wlen);
-        s[wlen] = '\0';
-        for (char *p = s; *p; p++)
-            *p = (char)tolower((unsigned char)*p);
+        size_t w = 0;
+        while (w < n && p[w] != ' ' && p[w] != '\t')
+            w++;
+        if (w >= 2 && ((p[0] == '"' && p[w - 1] == '"') ||
+                       (p[0] == '\'' && p[w - 1] == '\''))) {
+            p++;
+            w -= 2;
+        }
+        for (size_t k = 0; k < c->nblocked; k++) {
+            const char *b = c->blocked[k];
+            if (strlen(b) == w && strncasecmp(p, b, w) == 0)
+                return true;
+        }
+        start = i + 1;
     }
-    *n_out = n;
-    return out;
-}
-
-bool command_is_blocked(const config *c, const char *cmd)
-{
-    size_t n = 0;
-    char **cmds = command_split(cmd, &n);
-    bool blocked = false;
-    for (size_t i = 0; i < n && !blocked; i++)
-        for (size_t k = 0; k < c->nblocked; k++)
-            if (strcmp(cmds[i], c->blocked[k]) == 0) {
-                blocked = true;
-                break;
-            }
-    for (size_t i = 0; i < n; i++)
-        free(cmds[i]);
-    free(cmds);
-    return blocked;
+    return false;
 }

@@ -17,8 +17,33 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build
         run: make CC=${{ matrix.cc }}
-      - name: Unit tests and conformance
+      - name: Unit tests, pool test and conformance
         run: make CC=${{ matrix.cc }} check
+
+  n32:
+    name: 32-bit build (ILP32)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 32-bit libc
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gcc-multilib
+      - name: Build and test on a 32-bit target
+        run: make CC=gcc EXTRA="-m32"
+      - name: Unit tests, pool test and conformance on 32 bits
+        run: |
+          make CC=gcc EXTRA="-m32" check
+
+  sanitizers:
+    name: address and undefined behaviour
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build with sanitizers
+        run: make CC=clang EXTRA="-fsanitize=address,undefined -fno-omit-frame-pointer" EXTRA_LDFLAGS="-fsanitize=address,undefined"
+      - name: Run
+        run: |
+          python3 tests/test_pool.py ./dcm
+          python3 tests/conformance.py --binary ./dcm
 
   compare:
     name: compare with the original

@@ -7,7 +7,7 @@
 #include "tools.h"
 #include "util.h"
 
-#include <ctype.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,33 +38,32 @@ static char *to_eol(const char *s, bool crlf)
     return sb_take(&b);
 }
 
-/* Dice coefficient over character bigrams: 0..1, cheap and order blind. */
+/* Dice coefficient over character bigrams: 0..1, cheap and order blind. The
+ * 4096 bigrams live on the stack, so a failed edit allocates nothing. */
 static double similarity(const char *a, const char *b, size_t alen, size_t blen)
 {
     if (alen < 2 || blen < 2) {
         if (alen == 0 && blen == 0)
             return 1.0;
-        size_t m = alen < blen ? alen : blen;
-        return m ? 1.0 : 0.0;
+        return (alen && blen) ? 1.0 : 0.0;
     }
-    size_t cap = 4096;
-    unsigned long *hits = xmalloc(cap * sizeof *hits);
+    enum { CAP = 4096, TAKEN = 0x10000 };
+    uint32_t hits[CAP];
     size_t used = 0;
-    for (size_t i = 0; i + 1 < alen && used < cap; i++)
-        hits[used++] = ((unsigned long)(unsigned char)a[i] << 8) | (unsigned char)a[i + 1];
+    for (size_t i = 0; i + 1 < alen && used < CAP; i++)
+        hits[used++] = ((uint32_t)(unsigned char)a[i] << 8) | (unsigned char)a[i + 1];
 
     size_t common = 0;
     for (size_t j = 0; j + 1 < blen; j++) {
-        unsigned long g = ((unsigned long)(unsigned char)b[j] << 8) | (unsigned char)b[j + 1];
+        uint32_t g = ((uint32_t)(unsigned char)b[j] << 8) | (unsigned char)b[j + 1];
         for (size_t k = 0; k < used; k++) {
             if (hits[k] == g) {
-                hits[k] = 0xFFFF; /* one hit per bigram instance */
+                hits[k] = TAKEN; /* one hit per bigram instance */
                 common++;
                 break;
             }
         }
     }
-    free(hits);
     return (2.0 * (double)common) / (double)((alen - 1) + (blen - 1));
 }
 
@@ -78,7 +77,6 @@ static char *closest_window(const char *hay, const char *needle, size_t nlines,
     size_t best_line = 0;
 
     size_t line = 0, pos = 0;
-    size_t window = 0;
     while (pos < hay_len && line < 200000) {
         size_t p = pos;
         size_t n = 0;
@@ -102,15 +100,12 @@ static char *closest_window(const char *hay, const char *needle, size_t nlines,
             memcpy(best, hay + pos, p - pos);
             best[p - pos] = '\0';
         }
-        /* Advance one line. */
         const char *nl = strchr(hay + pos, '\n');
         if (!nl)
             break;
         pos = (size_t)(nl - hay) + 1;
         line++;
-        window++;
     }
-    (void)window;
     if (score)
         *score = best_score;
     if (start_line)
@@ -118,33 +113,32 @@ static char *closest_window(const char *hay, const char *needle, size_t nlines,
     return best;
 }
 
-tool_result tool_edit_block(json *a)
+tool_result tool_edit_block(jdoc *d, jref a)
 {
-    const char *path = jstr_get(a, "file_path", NULL);
+    const char *path = jstr_get(d, a, "file_path", NULL);
     if (!path || !*path)
-        return result_error("Missing file_path");
+        return result_error(d, "Missing file_path");
 
-    json *oldv = jget(a, "old_string");
-    json *newv = jget(a, "new_string");
-    bool has_text = oldv && oldv->t == J_STR && oldv->u.s[0] &&
-                    newv && newv->t == J_STR;
-    json *rangev = jget(a, "range");
-    bool has_range = rangev && rangev->t == J_STR && rangev->u.s[0] && jget(a, "content");
+    jref oldv = jget(d, a, "old_string");
+    jref newv = jget(d, a, "new_string");
+    jref rangev = jget(d, a, "range");
+    bool has_text = jis_str(d, oldv) && *jstr_of(d, oldv) && jis_str(d, newv);
+    bool has_range = jis_str(d, rangev) && *jstr_of(d, rangev) && jget(d, a, "content") != JNULL;
 
     if (!has_text && !has_range)
-        return result_error("Provide (old_string + new_string) or (range + content)");
+        return result_error(d, "Provide (old_string + new_string) or (range + content)");
     if (!has_text)
-        return result_error("Range editing is only supported for spreadsheet files; "
-                            "text files use old_string and new_string.");
+        return result_error(d, "Range editing is only supported for spreadsheet files; "
+                               "text files use old_string and new_string.");
 
-    long long expected = jint_get(a, "expected_replacements", 1);
+    int64_t expected = jint_get(d, a, "expected_replacements", 1);
     if (expected < 1)
         expected = 1;
 
     char *abs = NULL;
     char *err = validate_path(path, &abs);
     if (err) {
-        tool_result r = result_error("%s", err);
+        tool_result r = result_error(d, "%s", err);
         free(err);
         return r;
     }
@@ -152,7 +146,7 @@ tool_result tool_edit_block(json *a)
     size_t len = 0;
     char *content = read_file_all(abs, &len, &err);
     if (!content) {
-        tool_result r = result_error("%s", err);
+        tool_result r = result_error(d, "%s", err);
         free(err);
         free(abs);
         return r;
@@ -161,12 +155,12 @@ tool_result tool_edit_block(json *a)
     if (data_is_binary(content, len)) {
         free(content);
         free(abs);
-        return result_error("Cannot edit %s: the file is binary", path);
+        return result_error(d, "Cannot edit %s: the file is binary", path);
     }
 
     bool crlf = has_crlf(content);
-    char *search = to_eol(oldv->u.s, crlf);
-    char *replace = to_eol(newv->u.s, crlf);
+    char *search = to_eol(jstr_of(d, oldv), crlf);
+    char *replace = to_eol(jstr_of(d, newv), crlf);
 
     long long count = 0;
     char *updated = str_replace_all(content, search, replace, expected, &count);
@@ -189,7 +183,7 @@ tool_result tool_edit_block(json *a)
                       "The closest text is %.0f%% similar, below the 70%% match threshold.",
                       path, score * 100.0);
         }
-        tool_result r = result_text(b.p);
+        tool_result r = result_text(d, b.p ? b.p : "");
         sb_free(&b);
         free(near);
         free(search);
@@ -203,8 +197,8 @@ tool_result tool_edit_block(json *a)
         char *msg = xasprintf("Expected %lld occurrence(s) but found %lld in %s. "
                               "Nothing was changed. Set expected_replacements to %lld "
                               "to replace all of them.",
-                              expected, count, path, count);
-        tool_result r = result_text(msg);
+                              (long long)expected, count, path, count);
+        tool_result r = result_text(d, msg);
         free(msg);
         free(search);
         free(replace);
@@ -215,7 +209,7 @@ tool_result tool_edit_block(json *a)
 
     char *out = write_file_atomic(abs, updated, strlen(updated), false, 0644, &err);
     if (!out) {
-        tool_result r = result_error("%s", err);
+        tool_result r = result_error(d, "%s", err);
         free(err);
         free(updated);
         free(search);
@@ -234,8 +228,7 @@ tool_result tool_edit_block(json *a)
         change_at = count_lines_upto(updated, (size_t)(hit - updated));
     size_t first = change_at > 10 ? change_at - 10 : 0;
     size_t skip = first ? bytes_for_lines(updated, first) : 0;
-    size_t preview_lines = 20 + 1;
-    size_t preview_bytes = bytes_for_lines(updated + skip, preview_lines);
+    size_t preview_bytes = bytes_for_lines(updated + skip, 21);
     char *preview = xmalloc(preview_bytes + 1);
     memcpy(preview, updated + skip, preview_bytes);
     preview[preview_bytes] = '\0';
@@ -252,7 +245,7 @@ tool_result tool_edit_block(json *a)
                   shown, first, total, remaining);
     sb_put(&b, preview);
 
-    tool_result r = result_text(b.p);
+    tool_result r = result_text(d, b.p ? b.p : "");
     sb_free(&b);
     free(preview);
     free(updated);

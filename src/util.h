@@ -10,32 +10,26 @@
 #include <stddef.h>
 #include <sys/types.h>
 
-#define DCM_VERSION "1.0.0"
+#define DCM_VERSION "2.0.0"
 
+/* The build-time configuration of src/config.h, resolved once. */
 typedef struct {
-    char **blocked;
+    const char *const *blocked;
     size_t nblocked;
-    char *default_shell;
-    char **allowed;
+    const char *const *allowed; /* real paths; empty allows everything */
     size_t nallowed;
-    long long read_line_limit;  /* fileReadLineLimit */
-    long long write_line_limit; /* fileWriteLineLimit */
+    const char *shell;
+    int64_t read_line_limit;  /* fileReadLineLimit */
+    int64_t write_line_limit; /* fileWriteLineLimit */
 } config;
 
-/* config.c */
-config *config_load(void);
-void config_free(config *c);
-bool config_save(const config *c, char **err);
-json *config_to_json(const config *c);
-/* Sets one key. Returns false with a message for an unknown key or bad type. */
-bool config_set(config *c, const char *key, const json *value, char **err);
+const config *cfg(void);
+jref config_json(jdoc *d);
 
-/* util.c */
 void *xmalloc(size_t n);
 void *xrealloc(void *p, size_t n);
 char *xstrdup(const char *s);
 char *xasprintf(const char *fmt, ...);
-const char *dcm_config_dir(void);
 const char *dcm_home_dir(void);
 
 char *path_expand(const char *path);
@@ -65,10 +59,10 @@ bool str_ieq(const char *a, const char *b);
 bool str_iends(const char *s, const char *suffix);
 bool str_starts(const char *s, const char *prefix);
 
-/* Command blocklist: 1 when the command line holds a blocked command. */
-bool command_is_blocked(const config *c, const char *cmd);
-char **command_split(const char *cmd, size_t *n);
+/* Command blocklist: true when the first word of a command in the line is
+ * blocked. It walks the line once and allocates nothing. */
+bool command_is_blocked(const char *cmd);
 
-long long now_ms(void);
+int64_t now_ms(void);
 
 #endif

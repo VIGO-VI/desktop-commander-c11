@@ -57,44 +57,18 @@ static void test_names(void)
     CHECK(str_starts("hello", "he"));
 }
 
-static void test_command_split(void)
-{
-    size_t n = 0;
-    char **cmds = command_split("ls -la && rm -rf /tmp/x | grep y; echo done", &n);
-    CHECK(n == 4);
-    CHECK(n == 4 && strcmp(cmds[0], "ls") == 0);
-    CHECK(n == 4 && strcmp(cmds[1], "rm") == 0);
-    CHECK(n == 4 && strcmp(cmds[2], "grep") == 0);
-    CHECK(n == 4 && strcmp(cmds[3], "echo") == 0);
-    for (size_t i = 0; i < n; i++)
-        free(cmds[i]);
-    free(cmds);
-
-    cmds = command_split("'sudo' --version", &n);
-    CHECK(n == 1 && strcmp(cmds[0], "sudo") == 0);
-    for (size_t i = 0; i < n; i++)
-        free(cmds[i]);
-    free(cmds);
-
-    cmds = command_split("echo $(mkfs /dev/sda)", &n);
-    bool saw_mkfs = false;
-    for (size_t i = 0; i < n; i++) {
-        if (strcmp(cmds[i], "mkfs") == 0)
-            saw_mkfs = true;
-        free(cmds[i]);
-    }
-    CHECK(saw_mkfs);
-    free(cmds);
-}
-
 static void test_blocklist(void)
 {
-    config *c = config_load();
-    CHECK(command_is_blocked(c, "sudo ls"));
-    CHECK(command_is_blocked(c, "echo hi && sudo ls"));
-    CHECK(!command_is_blocked(c, "echo sudo"));
-    CHECK(!command_is_blocked(c, "ls -la"));
-    config_free(c);
+    CHECK(command_is_blocked("sudo ls"));
+    CHECK(command_is_blocked("echo hi && sudo ls"));
+    CHECK(command_is_blocked("ls | mkfs /dev/sda"));
+    CHECK(command_is_blocked("echo $(dd if=x)"));
+    CHECK(command_is_blocked("'sudo' --version"));
+    CHECK(command_is_blocked("SUDO ls"));
+    CHECK(!command_is_blocked("echo sudo"));
+    CHECK(!command_is_blocked("ls -la"));
+    CHECK(!command_is_blocked("echo \"a; sudo b\""));
+    CHECK(!command_is_blocked("echo \\; sudo"));
 }
 
 static void test_paths(void)
@@ -117,14 +91,24 @@ static void test_paths(void)
     free(out);
 }
 
+/* The compiled configuration is a constant table: no file, no allocation. */
+static void test_config(void)
+{
+    const config *c = cfg();
+    CHECK(c == cfg());
+    CHECK(c->nblocked > 0);
+    CHECK(c->shell && *c->shell);
+    CHECK(c->read_line_limit > 0 && c->write_line_limit > 0);
+}
+
 int main(void)
 {
     test_lines();
     test_replace();
     test_names();
-    test_command_split();
     test_blocklist();
     test_paths();
+    test_config();
     if (failures) {
         fprintf(stderr, "%d util test(s) failed\n", failures);
         return 1;

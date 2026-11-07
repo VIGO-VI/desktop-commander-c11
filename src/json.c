@@ -1,42 +1,60 @@
 /* SPDX-License-Identifier: MIT
  * Copyright 2026 the Desktop Commander C contributors
+ *
+ * JSON for one request. A document is three linear arrays: nodes, child
+ * chunks and bytes. Handles are 4-byte indices, so a document costs the same
+ * on a 32-bit target, and handing it back is `jdoc_reset` with no walk.
+ *
+ * The children of one container are 16-entry chunks linked in order. A
+ * container that is built, then holds while another is built, keeps its
+ * children where they are and appends in O(1).
  */
+#include "config.h"
 #include "json.h"
 
+#include <inttypes.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #define JSON_MAX_DEPTH 256
+#define CHUNK_SHIFT 4
+#define CHUNK_ENTS (1u << CHUNK_SHIFT)
 
-static void *xmalloc(size_t n)
-{
-    void *p = malloc(n ? n : 1);
-    if (!p) {
-        fputs("dcm: out of memory\n", stderr);
-        exit(2);
-    }
-    return p;
-}
+typedef struct {
+    jref v;
+    uint32_t key; /* string handle + 1, or 0 for an array element */
+} jent;
 
-static void *xrealloc(void *p, size_t n)
-{
-    void *q = realloc(p, n ? n : 1);
-    if (!q) {
-        fputs("dcm: out of memory\n", stderr);
-        exit(2);
-    }
-    return q;
-}
+typedef struct {
+    jent e[CHUNK_ENTS];
+    uint32_t next; /* chunk index + 1, or 0 */
+} jchunk;
 
-static char *xstrdup(const char *s)
-{
-    size_t n = strlen(s) + 1;
-    char *p = xmalloc(n);
-    memcpy(p, s, n);
-    return p;
-}
+typedef struct {
+    int64_t num;   /* an integer, or the bits of a real */
+    uint32_t a;    /* string handle, or the first chunk + 1 */
+    uint32_t n;    /* string length, or element count */
+    uint32_t last; /* the last chunk + 1, for a container */
+    uint8_t t;
+} jnode;
+
+struct jdoc {
+    jnode *nodes;
+    uint32_t nnodes, capnodes;
+    jchunk *chunks;
+    uint32_t nchunks, capchunks;
+    char *pool;
+    uint32_t pool_cap, pool_used;
+    char **big;
+    uint32_t nbig, capbig;
+};
+
+#define STR_BIG 0x80000000u
+
+void *xmalloc(size_t n);
+void *xrealloc(void *p, size_t n);
 
 /* ---------------------------------------------------------------- buffer */
 
@@ -52,8 +70,17 @@ void sb_free(sbuf *b)
     sb_init(b);
 }
 
+void sb_reset(sbuf *b)
+{
+    b->n = 0;
+    if (b->p)
+        b->p[0] = '\0';
+}
+
 static void sb_reserve(sbuf *b, size_t extra)
 {
+    if (extra > SIZE_MAX / 2 - b->cap)
+        abort();
     if (b->n + extra + 1 <= b->cap)
         return;
     size_t cap = b->cap ? b->cap : 64;
@@ -72,6 +99,8 @@ void sb_putc(sbuf *b, char c)
 
 void sb_putn(sbuf *b, const char *s, size_t n)
 {
+    if (!n)
+        return;
     sb_reserve(b, n);
     memcpy(b->p + b->n, s, n);
     b->n += n;
@@ -86,49 +115,34 @@ void sb_put(sbuf *b, const char *s)
 void sb_printf(sbuf *b, const char *fmt, ...)
 {
     va_list ap, ap2;
+    char tmp[256];
     va_start(ap, fmt);
     va_copy(ap2, ap);
-    int need = vsnprintf(NULL, 0, fmt, ap);
+    int need = vsnprintf(tmp, sizeof tmp, fmt, ap);
     va_end(ap);
     if (need < 0) {
         va_end(ap2);
         return;
     }
-    sb_reserve(b, (size_t)need);
-    vsnprintf(b->p + b->n, (size_t)need + 1, fmt, ap2);
-    b->n += (size_t)need;
+    if ((size_t)need < sizeof tmp) {
+        sb_putn(b, tmp, (size_t)need);
+    } else {
+        sb_reserve(b, (size_t)need);
+        vsnprintf(b->p + b->n, (size_t)need + 1, fmt, ap2);
+        b->n += (size_t)need;
+    }
     va_end(ap2);
 }
 
 char *sb_take(sbuf *b)
 {
-    if (!b->p) {
-        char *p = xmalloc(1);
-        p[0] = '\0';
-        return p;
-    }
     char *p = b->p;
+    if (!p) {
+        p = xmalloc(1);
+        p[0] = '\0';
+    }
     sb_init(b);
     return p;
-}
-
-static void utf8_put(sbuf *b, unsigned cp)
-{
-    if (cp < 0x80) {
-        sb_putc(b, (char)cp);
-    } else if (cp < 0x800) {
-        sb_putc(b, (char)(0xC0 | (cp >> 6)));
-        sb_putc(b, (char)(0x80 | (cp & 0x3F)));
-    } else if (cp < 0x10000) {
-        sb_putc(b, (char)(0xE0 | (cp >> 12)));
-        sb_putc(b, (char)(0x80 | ((cp >> 6) & 0x3F)));
-        sb_putc(b, (char)(0x80 | (cp & 0x3F)));
-    } else {
-        sb_putc(b, (char)(0xF0 | (cp >> 18)));
-        sb_putc(b, (char)(0x80 | ((cp >> 12) & 0x3F)));
-        sb_putc(b, (char)(0x80 | ((cp >> 6) & 0x3F)));
-        sb_putc(b, (char)(0x80 | (cp & 0x3F)));
-    }
 }
 
 void sb_json_str(sbuf *b, const char *s)
@@ -146,7 +160,7 @@ void sb_json_str(sbuf *b, const char *s)
             case '\f': sb_put(b, "\\f"); break;
             default:
                 if (*p < 0x20)
-                    sb_printf(b, "\\u%04x", *p);
+                    sb_printf(b, "\\u%04x", (unsigned)*p);
                 else
                     sb_putc(b, (char)*p);
             }
@@ -155,201 +169,399 @@ void sb_json_str(sbuf *b, const char *s)
     sb_putc(b, '"');
 }
 
-/* ---------------------------------------------------------------- node */
+/* ---------------------------------------------------------------- strings */
 
-static json *jnew(jtype t)
+static char *str_at(const jdoc *d, uint32_t ref)
 {
-    json *v = xmalloc(sizeof *v);
-    memset(v, 0, sizeof *v);
-    v->t = t;
-    return v;
+    return (ref & STR_BIG) ? d->big[ref & ~STR_BIG] : d->pool + ref;
 }
 
-json *jnull(void) { return jnew(J_NULL); }
-json *jbool(bool b) { json *v = jnew(J_BOOL); v->u.b = b; return v; }
-json *jint(long long i) { json *v = jnew(J_INT); v->u.i = i; return v; }
-json *jreal(double d) { json *v = jnew(J_REAL); v->u.d = d; return v; }
-json *jarr(void) { return jnew(J_ARR); }
-json *jobj(void) { return jnew(J_OBJ); }
-
-json *jstr(const char *s)
+/* Reserves n + 1 bytes and returns them uninitialised, or NULL when the size
+ * cannot be represented in a handle. */
+static char *str_alloc(jdoc *d, size_t n)
 {
-    json *v = jnew(J_STR);
-    v->u.s = xstrdup(s ? s : "");
-    return v;
+    if (n > 0x7FFFFFFEu)
+        return NULL;
+    if (!d->pool) {
+        d->pool_cap = DCM_REQUEST_STRINGS;
+        d->pool = xmalloc(d->pool_cap);
+        d->pool[0] = '\0';
+        d->pool_used = 1;
+    }
+    if (n + 1 <= (size_t)(d->pool_cap - d->pool_used)) {
+        char *p = d->pool + d->pool_used;
+        d->pool_used += (uint32_t)n + 1;
+        return p;
+    }
+    if (d->nbig == d->capbig) {
+        d->capbig = d->capbig ? d->capbig * 2 : 8;
+        d->big = xrealloc(d->big, (size_t)d->capbig * sizeof *d->big);
+    }
+    char *p = xmalloc(n + 1);
+    d->big[d->nbig] = p;
+    return p;
 }
 
-void json_free(json *v)
+/* Takes the handle of bytes that str_alloc handed out for this document. */
+static uint32_t str_handle(jdoc *d, char *p)
 {
-    if (!v)
+    if (p >= d->pool && p < d->pool + d->pool_cap)
+        return (uint32_t)(p - d->pool);
+    return STR_BIG | (d->nbig++);
+}
+
+static uint32_t str_put(jdoc *d, const char *s, size_t n)
+{
+    char *p = str_alloc(d, n);
+    if (!p)
+        return 0;
+    memcpy(p, s, n);
+    p[n] = '\0';
+    return str_handle(d, p);
+}
+
+/* ---------------------------------------------------------------- nodes */
+
+void jdoc_reset(jdoc *d)
+{
+    if (!d->nodes) {
+        d->capnodes = 256;
+        d->nodes = xmalloc((size_t)d->capnodes * sizeof *d->nodes);
+    }
+    /* Node 0 is the null node, so JNULL needs no special case anywhere. */
+    d->nodes[0] = (jnode){0};
+    d->nodes[0].t = J_NULL;
+    d->nnodes = 1;
+    d->nchunks = 0;
+    /* Byte 0 of the pool is never handed out, so handle 0 can mean "none". */
+    d->pool_used = 1;
+    for (uint32_t i = 0; i < d->nbig; i++)
+        free(d->big[i]);
+    d->nbig = 0;
+    if (d->pool)
+        d->pool[0] = '\0';
+}
+
+jdoc *jdoc_new(void)
+{
+    jdoc *d = xmalloc(sizeof *d);
+    memset(d, 0, sizeof *d);
+    jdoc_reset(d);
+    return d;
+}
+
+void jdoc_free(jdoc *d)
+{
+    if (!d)
         return;
-    switch (v->t) {
-    case J_STR:
-        free(v->u.s);
-        break;
-    case J_ARR:
-        for (size_t i = 0; i < v->u.a.n; i++)
-            json_free(v->u.a.v[i]);
-        free(v->u.a.v);
-        break;
-    case J_OBJ:
-        for (size_t i = 0; i < v->u.o.n; i++) {
-            free(v->u.o.k[i]);
-            json_free(v->u.o.v[i]);
+    for (uint32_t i = 0; i < d->nbig; i++)
+        free(d->big[i]);
+    free(d->big);
+    free(d->pool);
+    free(d->chunks);
+    free(d->nodes);
+    free(d);
+}
+
+static jref node_new(jdoc *d, jtype t)
+{
+    if (d->nnodes == 0)
+        jdoc_reset(d);
+    if (d->nnodes >= DCM_REQUEST_NODES)
+        return JNULL;
+    if (d->nnodes == d->capnodes) {
+        d->capnodes *= 2;
+        d->nodes = xrealloc(d->nodes, (size_t)d->capnodes * sizeof *d->nodes);
+    }
+    jref r = d->nnodes++;
+    d->nodes[r] = (jnode){0};
+    d->nodes[r].t = (uint8_t)t;
+    return r;
+}
+
+jref jnull(jdoc *d)
+{
+    (void)d;
+    return JNULL;
+}
+
+jref jbool(jdoc *d, bool b)
+{
+    jref r = node_new(d, J_BOOL);
+    d->nodes[r].n = b != 0;
+    return r;
+}
+
+jref jint(jdoc *d, int64_t i)
+{
+    jref r = node_new(d, J_INT);
+    d->nodes[r].num = i;
+    return r;
+}
+
+jref jreal(jdoc *d, double x)
+{
+    jref r = node_new(d, J_REAL);
+    uint64_t bits;
+    memcpy(&bits, &x, sizeof bits);
+    d->nodes[r].num = (int64_t)bits;
+    return r;
+}
+
+jref jstrn(jdoc *d, const char *s, size_t n)
+{
+    if (!s)
+        return JNULL;
+    uint32_t h = str_put(d, s, n);
+    if (!h)
+        return JNULL;
+    jref r = node_new(d, J_STR);
+    if (r == JNULL)
+        return r;
+    d->nodes[r].a = h;
+    d->nodes[r].n = (uint32_t)n;
+    return r;
+}
+
+jref jstr(jdoc *d, const char *s)
+{
+    return s ? jstrn(d, s, strlen(s)) : jstrn(d, "", 0);
+}
+
+jref jarr(jdoc *d)
+{
+    return node_new(d, J_ARR);
+}
+
+jref jobj(jdoc *d)
+{
+    return node_new(d, J_OBJ);
+}
+
+static jent *ent_at(jdoc *d, uint32_t first, uint32_t i)
+{
+    uint32_t c = first;
+    while (i >= CHUNK_ENTS) {
+        c = d->chunks[c].next - 1;
+        i -= CHUNK_ENTS;
+    }
+    return &d->chunks[c].e[i];
+}
+
+static const jent *ent_cat(const jdoc *d, uint32_t first, uint32_t i)
+{
+    uint32_t c = first;
+    while (i >= CHUNK_ENTS) {
+        c = d->chunks[c].next - 1;
+        i -= CHUNK_ENTS;
+    }
+    return &d->chunks[c].e[i];
+}
+
+static void chunk_push(jdoc *d, jref cont, jent e)
+{
+    jnode *node = &d->nodes[cont];
+    if (node->n % CHUNK_ENTS == 0) {
+        if (d->nchunks == d->capchunks) {
+            d->capchunks = d->capchunks ? d->capchunks * 2 : 16;
+            d->chunks = xrealloc(d->chunks, (size_t)d->capchunks * sizeof *d->chunks);
         }
-        free(v->u.o.k);
-        free(v->u.o.v);
-        break;
-    default:
-        break;
+        uint32_t c = d->nchunks++;
+        memset(&d->chunks[c], 0, sizeof d->chunks[c]);
+        if (node->last)
+            d->chunks[node->last - 1].next = c + 1;
+        else
+            node->a = c + 1;
+        node->last = c + 1;
     }
-    free(v);
+    d->chunks[node->last - 1].e[node->n % CHUNK_ENTS] = e;
+    node->n++;
 }
 
-void jarr_push(json *a, json *v)
+jref jarr_push(jdoc *d, jref a, jref v)
 {
-    if (a->t != J_ARR) {
-        json_free(v);
-        return;
-    }
-    if (a->u.a.n == a->u.a.cap) {
-        a->u.a.cap = a->u.a.cap ? a->u.a.cap * 2 : 4;
-        a->u.a.v = xrealloc(a->u.a.v, a->u.a.cap * sizeof *a->u.a.v);
-    }
-    a->u.a.v[a->u.a.n++] = v;
+    if (jtype_of(d, a) == J_ARR)
+        chunk_push(d, a, (jent){v, 0});
+    return a;
 }
 
-bool jobj_del(json *o, const char *k)
+static bool key_is(const jdoc *d, uint32_t key, const char *k)
 {
-    if (o->t != J_OBJ)
+    return key != 0 && strcmp(str_at(d, key), k) == 0;
+}
+
+jref jobj_set(jdoc *d, jref o, const char *k, jref v)
+{
+    if (jtype_of(d, o) != J_OBJ)
+        return o;
+    for (uint32_t i = 0; i < d->nodes[o].n; i++) {
+        jent *e = ent_at(d, d->nodes[o].a - 1, i);
+        if (key_is(d, e->key, k)) {
+            e->v = v;
+            return o;
+        }
+    }
+    uint32_t h = str_put(d, k, strlen(k));
+    chunk_push(d, o, (jent){v, h});
+    return o;
+}
+
+/* Drops entry `skip`: the later entries move one place back in one walk. */
+static jref ent_remove(jdoc *d, jref o, uint32_t skip)
+{
+    uint32_t first = d->nodes[o].a - 1;
+    uint32_t n = d->nodes[o].n;
+    jref removed = ent_at(d, first, skip)->v;
+    for (uint32_t i = skip + 1; i < n; i++)
+        *ent_at(d, first, i - 1) = *ent_at(d, first, i);
+    d->nodes[o].n = n - 1;
+    return removed;
+}
+
+jref jobj_take(jdoc *d, jref o, const char *k)
+{
+    if (jtype_of(d, o) != J_OBJ)
+        return JNULL;
+    for (uint32_t i = 0; i < d->nodes[o].n; i++)
+        if (key_is(d, ent_cat(d, d->nodes[o].a - 1, i)->key, k))
+            return ent_remove(d, o, i);
+    return JNULL;
+}
+
+bool jobj_del(jdoc *d, jref o, const char *k)
+{
+    if (jtype_of(d, o) != J_OBJ)
         return false;
-    for (size_t i = 0; i < o->u.o.n; i++) {
-        if (strcmp(o->u.o.k[i], k) == 0) {
-            free(o->u.o.k[i]);
-            json_free(o->u.o.v[i]);
-            memmove(&o->u.o.k[i], &o->u.o.k[i + 1], (o->u.o.n - i - 1) * sizeof *o->u.o.k);
-            memmove(&o->u.o.v[i], &o->u.o.v[i + 1], (o->u.o.n - i - 1) * sizeof *o->u.o.v);
-            o->u.o.n--;
+    for (uint32_t i = 0; i < d->nodes[o].n; i++)
+        if (key_is(d, ent_cat(d, d->nodes[o].a - 1, i)->key, k)) {
+            ent_remove(d, o, i);
             return true;
         }
-    }
     return false;
 }
 
-json *jobj_take(json *o, const char *k)
+/* ---------------------------------------------------------------- readers */
+
+jtype jtype_of(const jdoc *d, jref v)
 {
-    if (o->t != J_OBJ)
-        return NULL;
-    for (size_t i = 0; i < o->u.o.n; i++) {
-        if (strcmp(o->u.o.k[i], k) == 0) {
-            json *v = o->u.o.v[i];
-            free(o->u.o.k[i]);
-            memmove(&o->u.o.k[i], &o->u.o.k[i + 1], (o->u.o.n - i - 1) * sizeof *o->u.o.k);
-            memmove(&o->u.o.v[i], &o->u.o.v[i + 1], (o->u.o.n - i - 1) * sizeof *o->u.o.v);
-            o->u.o.n--;
-            return v;
-        }
+    if (!d || v == JNULL || v >= d->nnodes)
+        return J_NULL;
+    return (jtype)d->nodes[v].t;
+}
+
+bool jis_obj(const jdoc *d, jref v) { return jtype_of(d, v) == J_OBJ; }
+bool jis_arr(const jdoc *d, jref v) { return jtype_of(d, v) == J_ARR; }
+bool jis_str(const jdoc *d, jref v) { return jtype_of(d, v) == J_STR; }
+
+const char *jstr_of(const jdoc *d, jref v)
+{
+    return jtype_of(d, v) == J_STR ? str_at(d, d->nodes[v].a) : "";
+}
+
+double jnum_of(const jdoc *d, jref v)
+{
+    if (jtype_of(d, v) == J_REAL) {
+        uint64_t bits = (uint64_t)d->nodes[v].num;
+        double x;
+        memcpy(&x, &bits, sizeof x);
+        return x;
     }
-    return NULL;
-}
-
-void jobj_set(json *o, const char *k, json *v)
-{
-    if (o->t != J_OBJ) {
-        json_free(v);
-        return;
-    }
-    for (size_t i = 0; i < o->u.o.n; i++) {
-        if (strcmp(o->u.o.k[i], k) == 0) {
-            json_free(o->u.o.v[i]);
-            o->u.o.v[i] = v;
-            return;
-        }
-    }
-    if (o->u.o.n == o->u.o.cap) {
-        o->u.o.cap = o->u.o.cap ? o->u.o.cap * 2 : 4;
-        o->u.o.k = xrealloc(o->u.o.k, o->u.o.cap * sizeof *o->u.o.k);
-        o->u.o.v = xrealloc(o->u.o.v, o->u.o.cap * sizeof *o->u.o.v);
-    }
-    o->u.o.k[o->u.o.n] = xstrdup(k);
-    o->u.o.v[o->u.o.n] = v;
-    o->u.o.n++;
-}
-
-json *jget(const json *o, const char *k)
-{
-    if (!o || o->t != J_OBJ)
-        return NULL;
-    for (size_t i = 0; i < o->u.o.n; i++)
-        if (strcmp(o->u.o.k[i], k) == 0)
-            return o->u.o.v[i];
-    return NULL;
-}
-
-const char *jstr_get(const json *o, const char *k, const char *dflt)
-{
-    json *v = jget(o, k);
-    return (v && v->t == J_STR) ? v->u.s : dflt;
-}
-
-long long jint_get(const json *o, const char *k, long long dflt)
-{
-    json *v = jget(o, k);
-    if (!v)
-        return dflt;
-    if (v->t == J_INT)
-        return v->u.i;
-    if (v->t == J_REAL)
-        return (long long)v->u.d;
-    return dflt;
-}
-
-double jnum_get(const json *o, const char *k, double dflt)
-{
-    json *v = jget(o, k);
-    if (!v)
-        return dflt;
-    if (v->t == J_REAL)
-        return v->u.d;
-    if (v->t == J_INT)
-        return (double)v->u.i;
-    return dflt;
-}
-
-bool jbool_get(const json *o, const char *k, bool dflt)
-{
-    json *v = jget(o, k);
-    return (v && v->t == J_BOOL) ? v->u.b : dflt;
-}
-
-size_t jlen(const json *v)
-{
-    if (!v)
-        return 0;
-    if (v->t == J_ARR)
-        return v->u.a.n;
-    if (v->t == J_OBJ)
-        return v->u.o.n;
+    if (jtype_of(d, v) == J_INT)
+        return (double)d->nodes[v].num;
     return 0;
+}
+
+bool jbool_of(const jdoc *d, jref v)
+{
+    return jtype_of(d, v) == J_BOOL && d->nodes[v].n != 0;
+}
+
+int64_t jint_of(const jdoc *d, jref v, int64_t dflt)
+{
+    jtype t = jtype_of(d, v);
+    if (t == J_INT)
+        return d->nodes[v].num;
+    if (t == J_REAL)
+        return (int64_t)jnum_of(d, v);
+    return dflt;
+}
+
+jref jget(jdoc *d, jref o, const char *k)
+{
+    if (jtype_of(d, o) != J_OBJ)
+        return JNULL;
+    for (uint32_t i = 0; i < d->nodes[o].n; i++) {
+        const jent *e = ent_cat(d, d->nodes[o].a - 1, i);
+        if (key_is(d, e->key, k))
+            return e->v;
+    }
+    return JNULL;
+}
+
+const char *jstr_get(jdoc *d, jref o, const char *k, const char *dflt)
+{
+    jref v = jget(d, o, k);
+    return jtype_of(d, v) == J_STR ? jstr_of(d, v) : dflt;
+}
+
+int64_t jint_get(jdoc *d, jref o, const char *k, int64_t dflt)
+{
+    jref v = jget(d, o, k);
+    jtype t = jtype_of(d, v);
+    if (t == J_INT)
+        return d->nodes[v].num;
+    if (t == J_REAL)
+        return (int64_t)jnum_of(d, v);
+    return dflt;
+}
+
+double jnum_get(jdoc *d, jref o, const char *k, double dflt)
+{
+    jref v = jget(d, o, k);
+    jtype t = jtype_of(d, v);
+    return (t == J_REAL || t == J_INT) ? jnum_of(d, v) : dflt;
+}
+
+bool jbool_get(jdoc *d, jref o, const char *k, bool dflt)
+{
+    jref v = jget(d, o, k);
+    return jtype_of(d, v) == J_BOOL ? d->nodes[v].n != 0 : dflt;
+}
+
+size_t jlen(const jdoc *d, jref v)
+{
+    jtype t = jtype_of(d, v);
+    return (t == J_ARR || t == J_OBJ) ? d->nodes[v].n : 0;
+}
+
+jref jidx(const jdoc *d, jref v, size_t i)
+{
+    if (jtype_of(d, v) != J_ARR || i >= d->nodes[v].n)
+        return JNULL;
+    return ent_cat(d, d->nodes[v].a - 1, (uint32_t)i)->v;
+}
+
+const char *jkey(const jdoc *d, jref v, size_t i)
+{
+    if (jtype_of(d, v) != J_OBJ || i >= d->nodes[v].n)
+        return "";
+    uint32_t key = ent_cat(d, d->nodes[v].a - 1, (uint32_t)i)->key;
+    return key ? str_at(d, key) : "";
 }
 
 /* ---------------------------------------------------------------- parse */
 
 typedef struct {
-    const char *p;
-    const char *end;
-    char *err;
+    jdoc *d;
+    const char *p, *end;
+    const char *err;
     int depth;
 } parser;
 
 static bool perr(parser *ps, const char *msg)
 {
-    if (!ps->err) {
-        sbuf b;
-        sb_init(&b);
-        sb_printf(&b, "%s", msg);
-        ps->err = sb_take(&b);
-    }
+    if (!ps->err)
+        ps->err = msg;
     return false;
 }
 
@@ -371,11 +583,12 @@ static int hexval(int c)
     return -1;
 }
 
-static bool parse_hex4(parser *ps, unsigned *out)
+/* Reads one \\uXXXX at ps->p, with ps->p just past the 'u'. */
+static bool read_uescape(parser *ps, unsigned *cp)
 {
+    unsigned v = 0;
     if (ps->end - ps->p < 4)
         return perr(ps, "truncated \\u escape");
-    unsigned v = 0;
     for (int i = 0; i < 4; i++) {
         int h = hexval((unsigned char)ps->p[i]);
         if (h < 0)
@@ -383,82 +596,146 @@ static bool parse_hex4(parser *ps, unsigned *out)
         v = (v << 4) | (unsigned)h;
     }
     ps->p += 4;
-    *out = v;
+    if (v >= 0xD800 && v <= 0xDBFF) {
+        unsigned lo;
+        if (ps->end - ps->p >= 2 && ps->p[0] == '\\' && ps->p[1] == 'u') {
+            ps->p += 2;
+            unsigned l = 0;
+            if (ps->end - ps->p < 4)
+                return perr(ps, "truncated \\u escape");
+            for (int i = 0; i < 4; i++) {
+                int h = hexval((unsigned char)ps->p[i]);
+                if (h < 0)
+                    return perr(ps, "bad \\u escape");
+                l = (l << 4) | (unsigned)h;
+            }
+            ps->p += 4;
+            lo = l;
+            *cp = (lo >= 0xDC00 && lo <= 0xDFFF)
+                      ? 0x10000 + ((v - 0xD800) << 10) + (lo - 0xDC00)
+                      : 0xFFFD;
+        } else {
+            *cp = 0xFFFD;
+        }
+    } else if (v >= 0xDC00 && v <= 0xDFFF) {
+        *cp = 0xFFFD;
+    } else {
+        *cp = v;
+    }
     return true;
 }
 
-static bool parse_string(parser *ps, char **out)
+static size_t utf8_len(unsigned cp)
 {
-    if (ps->p >= ps->end || *ps->p != '"')
-        return perr(ps, "expected string");
-    ps->p++;
-    sbuf b;
-    sb_init(&b);
+    return cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+}
+
+static void utf8_write(char *p, unsigned cp)
+{
+    if (cp < 0x80) {
+        p[0] = (char)cp;
+    } else if (cp < 0x800) {
+        p[0] = (char)(0xC0 | (cp >> 6));
+        p[1] = (char)(0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+        p[0] = (char)(0xE0 | (cp >> 12));
+        p[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        p[2] = (char)(0x80 | (cp & 0x3F));
+    } else {
+        p[0] = (char)(0xF0 | (cp >> 18));
+        p[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+        p[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        p[3] = (char)(0x80 | (cp & 0x3F));
+    }
+}
+
+/* Measures the string that starts at ps->p (just past its opening quote) and
+ * leaves ps->p on the closing quote. */
+static bool measure_string(parser *ps, size_t *out)
+{
+    size_t n = 0;
     while (ps->p < ps->end) {
         unsigned char c = (unsigned char)*ps->p++;
         if (c == '"') {
-            *out = sb_take(&b);
+            *out = n;
+            ps->p--;
             return true;
         }
-        if (c < 0x20) {
-            sb_free(&b);
+        if (c < 0x20)
             return perr(ps, "control character in string");
-        }
         if (c != '\\') {
-            sb_putc(&b, (char)c);
+            n++;
             continue;
         }
-        if (ps->p >= ps->end) {
-            sb_free(&b);
+        if (ps->p >= ps->end)
             return perr(ps, "truncated escape");
-        }
         char e = *ps->p++;
         switch (e) {
-        case '"': sb_putc(&b, '"'); break;
-        case '\\': sb_putc(&b, '\\'); break;
-        case '/': sb_putc(&b, '/'); break;
-        case 'b': sb_putc(&b, '\b'); break;
-        case 'f': sb_putc(&b, '\f'); break;
-        case 'n': sb_putc(&b, '\n'); break;
-        case 'r': sb_putc(&b, '\r'); break;
-        case 't': sb_putc(&b, '\t'); break;
+        case '"': case '\\': case '/': case 'b': case 'f':
+        case 'n': case 'r': case 't':
+            n++;
+            break;
         case 'u': {
-            unsigned cp;
-            if (!parse_hex4(ps, &cp)) {
-                sb_free(&b);
+            unsigned cp = 0;
+            if (!read_uescape(ps, &cp))
                 return false;
-            }
-            if (cp >= 0xD800 && cp <= 0xDBFF) {
-                unsigned lo;
-                if (ps->end - ps->p >= 2 && ps->p[0] == '\\' && ps->p[1] == 'u') {
-                    ps->p += 2;
-                    if (!parse_hex4(ps, &lo)) {
-                        sb_free(&b);
-                        return false;
-                    }
-                    if (lo >= 0xDC00 && lo <= 0xDFFF)
-                        cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
-                    else
-                        cp = 0xFFFD;
-                } else {
-                    cp = 0xFFFD;
-                }
-            } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
-                cp = 0xFFFD;
-            }
-            utf8_put(&b, cp);
+            n += utf8_len(cp);
             break;
         }
         default:
-            sb_free(&b);
             return perr(ps, "unknown escape");
         }
     }
-    sb_free(&b);
     return perr(ps, "unterminated string");
 }
 
-static json *parse_number(parser *ps)
+static bool parse_string(parser *ps, uint32_t *handle)
+{
+    if (ps->p >= ps->end || *ps->p != '"')
+        return perr(ps, "expected string");
+    const char *start = ++ps->p;
+    size_t n = 0;
+    if (!measure_string(ps, &n))
+        return false;
+    jdoc *d = ps->d;
+    char *dst = str_alloc(d, n);
+    if (!dst)
+        return perr(ps, "string too long");
+    char *w = dst;
+    ps->p = start;
+    while (*ps->p != '"') {
+        unsigned char c = (unsigned char)*ps->p++;
+        if (c != '\\') {
+            *w++ = (char)c;
+            continue;
+        }
+        char e = *ps->p++;
+        switch (e) {
+        case '"': *w++ = '"'; break;
+        case '\\': *w++ = '\\'; break;
+        case '/': *w++ = '/'; break;
+        case 'b': *w++ = '\b'; break;
+        case 'f': *w++ = '\f'; break;
+        case 'n': *w++ = '\n'; break;
+        case 'r': *w++ = '\r'; break;
+        case 't': *w++ = '\t'; break;
+        default: {
+            unsigned cp = 0;
+            if (!read_uescape(ps, &cp))
+                return false;
+            utf8_write(w, cp);
+            w += utf8_len(cp);
+            break;
+        }
+        }
+    }
+    ps->p++; /* the closing quote */
+    *w = '\0';
+    *handle = str_handle(d, dst);
+    return true;
+}
+
+static jref parse_number(parser *ps)
 {
     const char *start = ps->p;
     bool real = false;
@@ -482,9 +759,8 @@ static json *parse_number(parser *ps)
     }
     if (ps->p == start) {
         perr(ps, "expected value");
-        return NULL;
+        return JNULL;
     }
-
     char tmp[64];
     size_t n = (size_t)(ps->p - start);
     if (n >= sizeof tmp)
@@ -495,29 +771,34 @@ static json *parse_number(parser *ps)
         char *endp = NULL;
         long long i = strtoll(tmp, &endp, 10);
         if (endp && *endp == '\0')
-            return jint(i);
+            return jint(ps->d, i);
     }
-    return jreal(strtod(tmp, NULL));
+    return jreal(ps->d, strtod(tmp, NULL));
 }
 
-static bool parse_into(parser *ps, json **out);
+static jref parse_into(parser *ps);
 
-static bool parse_array(parser *ps, json *a)
+static jref parse_array(parser *ps)
 {
-    ps->p++; /* [ */
+    jref a = jarr(ps->d);
+    if (a == JNULL)
+        return JNULL;
+    ps->p++;
     skip_ws(ps);
     if (ps->p < ps->end && *ps->p == ']') {
         ps->p++;
-        return true;
+        return a;
     }
     for (;;) {
-        json *v = NULL;
-        if (!parse_into(ps, &v))
-            return false;
-        jarr_push(a, v);
+        jref v = parse_into(ps);
+        if (ps->err)
+            return JNULL;
+        jarr_push(ps->d, a, v);
         skip_ws(ps);
-        if (ps->p >= ps->end)
-            return perr(ps, "unterminated array");
+        if (ps->p >= ps->end) {
+            perr(ps, "unterminated array");
+            return JNULL;
+        }
         if (*ps->p == ',') {
             ps->p++;
             skip_ws(ps);
@@ -525,206 +806,190 @@ static bool parse_array(parser *ps, json *a)
         }
         if (*ps->p == ']') {
             ps->p++;
-            return true;
+            return a;
         }
-        return perr(ps, "expected , or ]");
+        perr(ps, "expected , or ]");
+        return JNULL;
     }
 }
 
-static bool parse_object(parser *ps, json *o)
+static jref parse_object(parser *ps)
 {
-    ps->p++; /* { */
+    jref o = jobj(ps->d);
+    if (o == JNULL)
+        return JNULL;
+    ps->p++;
     skip_ws(ps);
     if (ps->p < ps->end && *ps->p == '}') {
         ps->p++;
-        return true;
+        return o;
     }
     for (;;) {
-        char *k = NULL;
         skip_ws(ps);
-        if (ps->p >= ps->end)
-            return perr(ps, "unterminated object");
+        uint32_t k = 0;
         if (!parse_string(ps, &k))
-            return false;
+            return JNULL;
         skip_ws(ps);
         if (ps->p >= ps->end || *ps->p != ':') {
-            free(k);
-            return perr(ps, "expected :");
+            perr(ps, "expected :");
+            return JNULL;
         }
         ps->p++;
-        json *v = NULL;
-        if (!parse_into(ps, &v)) {
-            free(k);
-            return false;
-        }
-        jobj_set(o, k, v);
-        free(k);
+        jref v = parse_into(ps);
+        if (ps->err)
+            return JNULL;
+        chunk_push(ps->d, o, (jent){v, k});
         skip_ws(ps);
-        if (ps->p >= ps->end)
-            return perr(ps, "unterminated object");
+        if (ps->p >= ps->end) {
+            perr(ps, "unterminated object");
+            return JNULL;
+        }
         if (*ps->p == ',') {
             ps->p++;
             continue;
         }
         if (*ps->p == '}') {
             ps->p++;
-            return true;
+            return o;
         }
-        return perr(ps, "expected , or }");
+        perr(ps, "expected , or }");
+        return JNULL;
     }
 }
 
-static bool parse_into(parser *ps, json **out)
+static jref parse_into(parser *ps)
 {
     skip_ws(ps);
-    if (ps->p >= ps->end)
-        return perr(ps, "unexpected end of input");
-    if (++ps->depth > JSON_MAX_DEPTH)
-        return perr(ps, "nesting too deep");
-
+    if (ps->p >= ps->end) {
+        perr(ps, "unexpected end of input");
+        return JNULL;
+    }
+    if (++ps->depth > JSON_MAX_DEPTH) {
+        perr(ps, "nesting too deep");
+        return JNULL;
+    }
+    jref v = JNULL;
     char c = *ps->p;
-    bool ok = true;
-    json *v = NULL;
-
     if (c == '{') {
-        v = jobj();
-        ok = parse_object(ps, v);
+        v = parse_object(ps);
     } else if (c == '[') {
-        v = jarr();
-        ok = parse_array(ps, v);
+        v = parse_array(ps);
     } else if (c == '"') {
-        char *s = NULL;
-        ok = parse_string(ps, &s);
-        if (ok) {
-            v = jstr(s);
-            free(s);
+        uint32_t h = 0;
+        if (parse_string(ps, &h)) {
+            v = node_new(ps->d, J_STR);
+            if (v == JNULL) {
+                perr(ps, "request too large");
+            } else {
+                ps->d->nodes[v].a = h;
+                ps->d->nodes[v].n = 0;
+            }
         }
     } else if (c == 't' && ps->end - ps->p >= 4 && memcmp(ps->p, "true", 4) == 0) {
         ps->p += 4;
-        v = jbool(true);
+        v = jbool(ps->d, true);
     } else if (c == 'f' && ps->end - ps->p >= 5 && memcmp(ps->p, "false", 5) == 0) {
         ps->p += 5;
-        v = jbool(false);
+        v = jbool(ps->d, false);
     } else if (c == 'n' && ps->end - ps->p >= 4 && memcmp(ps->p, "null", 4) == 0) {
         ps->p += 4;
-        v = jnull();
     } else if (c == '-' || (c >= '0' && c <= '9')) {
         v = parse_number(ps);
-        ok = v != NULL;
     } else {
-        ok = perr(ps, "unexpected character");
+        perr(ps, "unexpected character");
     }
-
     ps->depth--;
-    if (!ok) {
-        json_free(v);
+    return ps->err ? JNULL : v;
+}
+
+bool json_parse(jdoc *d, const char *text, size_t len, jref *out, const char **err)
+{
+    if (err)
+        *err = NULL;
+    jdoc_reset(d);
+    parser ps = {.d = d, .p = text, .end = text + len, .err = NULL, .depth = 0};
+    if (len >= 3 && (unsigned char)text[0] == 0xEF && (unsigned char)text[1] == 0xBB &&
+        (unsigned char)text[2] == 0xBF)
+        ps.p += 3;
+    jref v = parse_into(&ps);
+    if (ps.err) {
+        if (err)
+            *err = ps.err;
+        return false;
+    }
+    skip_ws(&ps);
+    if (ps.p != ps.end) {
+        if (err)
+            *err = "trailing characters after value";
         return false;
     }
     *out = v;
     return true;
 }
 
-json *json_parse(const char *text, size_t len, char **err)
-{
-    parser ps = { .p = text, .end = text + len, .err = NULL, .depth = 0 };
-    json *v = NULL;
-    if (len > 0 && (unsigned char)text[0] == 0xEF && len > 2 &&
-        (unsigned char)text[1] == 0xBB && (unsigned char)text[2] == 0xBF) {
-        ps.p += 3;
-    }
-    if (!parse_into(&ps, &v)) {
-        if (err)
-            *err = ps.err ? ps.err : xstrdup("parse error");
-        else
-            free(ps.err);
-        return NULL;
-    }
-    skip_ws(&ps);
-    if (ps.p != ps.end) {
-        json_free(v);
-        free(ps.err);
-        if (err)
-            *err = xstrdup("trailing characters after value");
-        return NULL;
-    }
-    free(ps.err);
-    if (err)
-        *err = NULL;
-    return v;
-}
-
 /* ---------------------------------------------------------------- dump */
 
-static void dump_into(sbuf *b, const json *v, bool pretty, int indent)
+static void indent(sbuf *b, int depth)
 {
-    switch (v->t) {
-    case J_NULL:
-        sb_put(b, "null");
-        break;
-    case J_BOOL:
-        sb_put(b, v->u.b ? "true" : "false");
-        break;
-    case J_INT:
-        sb_printf(b, "%lld", v->u.i);
-        break;
-    case J_REAL: {
-        char tmp[40];
-        snprintf(tmp, sizeof tmp, "%.17g", v->u.d);
-        sb_put(b, tmp);
-        break;
-    }
-    case J_STR:
-        sb_json_str(b, v->u.s);
-        break;
-    case J_ARR:
-        sb_putc(b, '[');
-        for (size_t i = 0; i < v->u.a.n; i++) {
-            if (i)
-                sb_putc(b, ',');
-            if (pretty) {
-                sb_putc(b, '\n');
-                for (int k = 0; k <= indent; k++)
-                    sb_put(b, "  ");
-            }
-            dump_into(b, v->u.a.v[i], pretty, indent + 1);
-        }
-        if (pretty && v->u.a.n) {
-            sb_putc(b, '\n');
-            for (int k = 0; k < indent; k++)
-                sb_put(b, "  ");
-        }
-        sb_putc(b, ']');
-        break;
-    case J_OBJ:
-        sb_putc(b, '{');
-        for (size_t i = 0; i < v->u.o.n; i++) {
-            if (i)
-                sb_putc(b, ',');
-            if (pretty) {
-                sb_putc(b, '\n');
-                for (int k = 0; k <= indent; k++)
-                    sb_put(b, "  ");
-            }
-            sb_json_str(b, v->u.o.k[i]);
-            sb_putc(b, ':');
-            if (pretty)
-                sb_putc(b, ' ');
-            dump_into(b, v->u.o.v[i], pretty, indent + 1);
-        }
-        if (pretty && v->u.o.n) {
-            sb_putc(b, '\n');
-            for (int k = 0; k < indent; k++)
-                sb_put(b, "  ");
-        }
-        sb_putc(b, '}');
-        break;
-    }
+    for (int i = 0; i < depth; i++)
+        sb_putn(b, "  ", 2);
 }
 
-char *json_dump(const json *v, bool pretty)
+static void dump_into(sbuf *b, const jdoc *d, jref v, bool pretty, int depth)
 {
-    sbuf b;
-    sb_init(&b);
-    dump_into(&b, v, pretty, 0);
-    return sb_take(&b);
+    if (depth > JSON_MAX_DEPTH) {
+        sb_put(b, "null");
+        return;
+    }
+    jtype t = jtype_of(d, v);
+    switch (t) {
+    case J_NULL:
+        sb_put(b, "null");
+        return;
+    case J_BOOL:
+        sb_put(b, jbool_of(d, v) ? "true" : "false");
+        return;
+    case J_INT:
+        sb_printf(b, "%" PRId64, d->nodes[v].num);
+        return;
+    case J_REAL: {
+        char tmp[40];
+        snprintf(tmp, sizeof tmp, "%.17g", jnum_of(d, v));
+        sb_put(b, tmp);
+        return;
+    }
+    case J_STR:
+        sb_json_str(b, jstr_of(d, v));
+        return;
+    case J_ARR:
+    case J_OBJ:
+        break;
+    }
+    bool obj = (t == J_OBJ);
+    uint32_t n = d->nodes[v].n;
+    uint32_t first = d->nodes[v].a - 1;
+    sb_putc(b, obj ? '{' : '[');
+    for (uint32_t i = 0; i < n; i++) {
+        if (i)
+            sb_putc(b, ',');
+        if (pretty) {
+            sb_putc(b, '\n');
+            indent(b, depth + 1);
+        }
+        if (obj) {
+            sb_json_str(b, jkey(d, v, i));
+            sb_put(b, pretty ? ": " : ":");
+        }
+        dump_into(b, d, ent_cat(d, first, i)->v, pretty, depth + 1);
+    }
+    if (pretty && n) {
+        sb_putc(b, '\n');
+        indent(b, depth);
+    }
+    sb_putc(b, obj ? '}' : ']');
+}
+
+void json_dump_into(sbuf *b, const jdoc *d, jref v, bool pretty)
+{
+    dump_into(b, d, v, pretty, 0);
 }

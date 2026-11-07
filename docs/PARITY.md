@@ -13,8 +13,8 @@ Everything else keeps its name, its arguments and the shape of its answer.
 
 | Tool | State | Notes |
 | --- | --- | --- |
-| `get_config` | same | Same keys. `telemetryEnabled` is replaced by `telemetry: "none"`. |
-| `set_config_value` | same | Same keys; `telemetryEnabled` is refused with a message. |
+| `get_config` | same keys | Reports the values compiled in `src/config.h`. `telemetryEnabled` is replaced by `telemetry: "none"`. |
+| `set_config_value` | refused | Answers with an error that names `src/config.h`: the configuration is set at build time. |
 | `read_file` | same | Text, images (PNG/JPEG/GIF/WebP), offset (negative = tail), length. No URL, PDF, Excel or DOCX. |
 | `read_multiple_files` | same | Text and image blocks; a failed file does not stop the others. |
 | `write_file` | same | `rewrite` and `append`; an existing non-empty file needs an explicit mode. |
@@ -48,6 +48,13 @@ Everything else keeps its name, its arguments and the shape of its answer.
   and memory columns. It is one pass over `/proc` with no fork.
 - A process session merges stdout and stderr into one stream, as the original's
   output buffer does.
+- A process session keeps 4 MB of output and a search keeps 8192 rows. Both
+  numbers are in `src/config.h`; the original grows until the machine stops.
+- The configuration is not read from or written to `config.json`. A client that
+  sets a value gets the error that names the header.
+- The server runs tool calls on 8 worker threads and takes 32 requests at once,
+  so two or three agents do not queue behind a waiting command. The original
+  runs one call at a time.
 
 ## Conformance result
 
@@ -70,8 +77,11 @@ installs ripgrep and builds the original, the run prints no `SKIP` and no
 cases are skipped there and our results are checked against fixed
 expectations in the fixture instead.
 
-The same run passes under `-fsanitize=address,undefined` on macOS.
+The same run passes under `-fsanitize=address,undefined` on macOS, and
+`tests/test_pool.py` passes beside it: 32 calls in flight, one of them blocking,
+and the others answer first.
 
 The CI runs on Ubuntu with gcc and clang: both build the server, run the unit
-tests, run the 16 cases, and the `compare` job runs all 16 against the
-original.
+tests, the pool test and the 16 cases, a 32-bit job builds with `-m32` and runs
+the same, a sanitizer job runs the pool test and the 16 cases, and the `compare`
+job runs all 16 against the original.

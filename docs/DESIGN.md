@@ -2,31 +2,39 @@
 
 ## Shape
 
-One process, one thread per concern, no event loop. `src/main.c` reads one
-JSON-RPC message per line from stdin, dispatches a tool, writes one line to
-stdout, and flushes. Anything a human might read goes to stderr, so a client
-never parses a log line as a result.
+One process, a fixed pool of worker threads, no event loop. A reader takes one
+JSON-RPC message per line from stdin and hands it to a free worker. The worker
+parses the message into its own document, dispatches the tool, writes the
+answer and clears the document for the next request. Anything a human might
+read goes to stderr, so a client never parses a log line as a result.
 
 ```
-stdin ──▶ json_parse ──▶ tools/call ──▶ tool fn ──▶ tool_result ──▶ stdout
+stdin ──▶ slot ──▶ worker ──▶ json_parse ──▶ tool fn ──▶ stdout (one write)
 ```
 
-A tool function receives the parsed `arguments` object and returns
-`{content, structuredContent, isError}`. Content is an array of MCP blocks, so
-images and text share one shape. No tool writes to stdout itself.
+A tool function receives the request document and the arguments object, and
+returns `{content, structuredContent, isError}` as handles of the same
+document. Content is an array of MCP blocks, so images and text share one
+shape. No tool writes to stdout itself.
 
 ## Threads
 
-| Thread | Role |
-| --- | --- |
-| main | protocol loop; runs each tool call to completion |
-| reader (one per process session) | drains the output pipe into the session's line buffer |
-| reaper (one) | `waitpid(-1)` collects exit statuses, so no zombie survives |
-| search (one per search session, detached) | walks the tree and appends rows |
+| Thread | Count | Role |
+| --- | --- | --- |
+| reader | 1 (main) | reads lines, waits when 32 requests are in flight |
+| worker | `DCM_WORKERS` (8) | parses and runs one request at a time |
+| reader (process session) | one per session | drains the output pipe into the session ring |
+| reaper | 1 | `waitpid(-1)` collects exit statuses, so no zombie survives |
+| search | one per search session | walks the tree and appends rows |
 
-Process sessions and search sessions are the only long-lived state. Both take a
-mutex and a condition variable; a read waits on the condition, so a REPL that
-is quiet costs nothing and answers the moment it prints.
+A worker stack is `DCM_WORKER_STACK` (192 KB), set at creation. The JSON parser
+is iterative in the sense that it recurses only on nesting, which is bounded at
+256, and the walker is bounded by the tree.
+
+Two or three agents of a client send up to 32 calls at once. The reader copies
+the line into a slot and wakes a worker, so a call that waits on a prompt parks
+one worker and no other. When every slot is busy the reader waits for one,
+which is the backpressure: memory does not grow with the client's queue.
 
 `start_process` forks a child into its own session (`setsid`) with one pipe for
 stdout and stderr and one for stdin. That group is what `force_terminate`
@@ -39,13 +47,44 @@ needs no fork. Other Unix systems fall back to `ps`.
 
 ## Memory
 
-Every value is either owned by its container or explicitly taken with
-`jobj_take`. `json_free` walks the tree. There is no arena and no garbage
-collector; the server's steady state is the session buffers plus the call
-history ring (200 entries).
+There is no per-object allocation in a request. The JSON document is three
+linear arrays:
 
-The output buffer of a session is capped at 50 MB. The oldest lines are evicted
-first and the answer says how many, so line numbers are never silently wrong.
+- nodes of 24 bytes (20 on a 32-bit target), addressed by a 4-byte index;
+- child chunks of 16 entries, linked in order, so a container that goes on hold
+  while another is built keeps its children in place;
+- a byte pool for strings, and one block for a string that does not fit it.
+
+`jdoc_reset` clears the counts and hands the same buffers back, so a server of
+steady traffic allocates once per worker. A string handle is 4 bytes and never
+zero, so an absent key and the empty string are different.
+
+Sessions are slots of static arrays: `g_procs[DCM_MAX_SESSIONS]` and
+`g_searches[DCM_MAX_SEARCHES]`. A slot is reused when its thread has left, and
+the count of sessions is what bounds the memory.
+
+A process session keeps its output in a byte ring of `DCM_SESSION_BYTES`
+(4 MB). A new line goes into the free space and the oldest whole lines are
+dropped, so a process that prints for an hour costs the same as one that
+prints a page, and line numbers say how many lines were dropped.
+
+A search session keeps its rows as NUL-terminated strings in one block of
+`DCM_SEARCH_BYTES`, with an index of 4-byte offsets and a flag bit that marks a
+context row. The reader and the walker share the block under the session lock.
+
+The call history is a ring of `DCM_HISTORY_ENTRIES` inline records: a tool name,
+a time, a flag and a 96-byte summary of the arguments. Nothing is stored as
+JSON and nothing is freed.
+
+## Configuration
+
+`src/config.h` holds every setting; `make` copies it from `src/config.def.h` the
+first time. `cfg()` resolves the allowlist with `realpath` once, behind
+`pthread_once`, and every tool reads the same const struct. There is no file to
+parse, no value to set, and no allocation on the path of a path check.
+
+`set_config_value` is kept for clients that call it, and answers with the error
+that names the header.
 
 ## Search
 
@@ -67,18 +106,25 @@ lines, so `stop_search` answers within one file, not one tree.
 
 - `initialize` echoes the requested `protocolVersion`, and advertises tools,
   resources, prompts and logging, all empty but present.
-- Unknown methods get `-32601`; a malformed line gets `-32700` with no id.
+- Unknown methods get `-32601`; a malformed line gets `-32700` with no id, and
+  a line over `DCM_MAX_REQUEST_BYTES` gets `-32600` without being buffered.
 - Notifications never get an answer.
 - Notifications from the client (`notifications/initialized`,
   `notifications/cancelled`) are accepted and ignored.
+- The tool list is written from the table: the schemas are JSON text in the
+  binary, so a listing parses nothing and copies nothing.
 
 ## Why C11
 
 The original's dependency tree is 1,043 packages and a downloaded ripgrep. The
 work is: read a file, write a file, match a string, wait on a pipe. The C
-library does all of it. A single 65 KB binary starts in under a millisecond,
+library does all of it. A single 118 KB binary starts in under a millisecond,
 which matters when a client spawns it for every session, and it has no update
 path to defend.
 
-Strict aliasing and `-fwrapv` rules of the larger project this came from do not
-apply here; the code uses plain C11 with `_GNU_SOURCE` for the Linux calls.
+The code is plain ISO C11 with `_GNU_SOURCE` for the Linux calls. It builds
+without `-fwrapv`: arithmetic that wraps is done in unsigned types, and a
+product that can overflow gets a wider intermediate. It builds with strict
+aliasing on, and `-Wstrict-aliasing=2` must stay quiet. A byte buffer is read
+through `char`, an integer built from wire bytes goes through `memcpy`, and a
+node is read only through its own type.

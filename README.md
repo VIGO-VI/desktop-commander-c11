@@ -4,7 +4,7 @@ An MCP server for files, searches and long-running terminal sessions. It is a
 rewrite of [DesktopCommanderMCP](https://github.com/wonderwhy-er/DesktopCommanderMCP)
 in C11 for Linux, with no Node.js, no runtime dependencies and no telemetry.
 
-- One static binary, about 140 KB. Only the C library and pthreads.
+- One binary, configured at build time. Only the C library and pthreads.
 - Same tool names and arguments as the original, so an existing client works.
 - Same result text and file effects for the tools it covers. The conformance
   test runs both servers side by side and compares them.
@@ -22,6 +22,25 @@ packages and a ripgrep download. Its first request sends telemetry events, and
 it starts a background updater. This build is one process, one file per tool
 family, and the only things it writes are the files a tool was asked to write.
 
+## Size and memory
+
+The layout is data oriented: a request is an arena of nodes addressed by 4-byte
+indices, sessions are slots of static arrays, and output buffers are rings that
+are written once and never moved. Nothing is allocated for each JSON node, each
+line of output or each search row, and a completed request hands its arena back
+for the next one.
+
+| Measure | This build | The previous build of this rewrite |
+| --- | --- | --- |
+| Binary, default `make`, macOS arm64 | 118 KB | 138 KB |
+| Code section | 39 KB | 51 KB |
+| Peak RSS, one process that prints 20 MB | 21 MB | 100 MB |
+| Peak RSS, a content search with 50,000 results | 3 MB | 47 MB |
+
+A 32-bit build (`make EXTRA=-m32`) uses the same handles of 4 bytes and the same
+`size_t` bounds, so a document, a session slot and a search row cost less there,
+not more.
+
 ## What it does
 
 | Area | Tools |
@@ -37,22 +56,46 @@ A process session is a child in its own session group with one output pipe, a
 reader thread and a reaper. `start_process` collects the first output, and the
 session stays alive for `interact_with_process` and `read_process_output`:
 REPLs, SSH, database clients and servers all work. `force_terminate` ends the
-group, not just the shell.
+group, not just the shell. Output is kept in a ring of `DCM_SESSION_BYTES`, and
+the oldest lines go first, so a process that floods costs a fixed amount.
 
 A search is a session too. `start_search` returns at once, a thread walks the
 tree, and `get_more_search_results` pages the rows. Patterns are POSIX extended
 regular expressions, or literal strings with `literalSearch`.
 
+The reader takes 32 requests before it waits (`DCM_MAX_INFLIGHT`) and runs them
+on 8 worker threads (`DCM_WORKERS`), so the calls of two or three agents do not
+queue behind a command that waits on a prompt. Each worker keeps its JSON
+document and its output buffer between requests.
+
 ## Build and test
 
 ```sh
-make                # builds ./dcm
-make check          # unit tests and the conformance run
+make                # builds ./dcm, -Oz or -Os
+make check          # unit tests, the 32-request pool test, the conformance run
+make debug          # the same with debug information
+make config         # writes src/config.h from src/config.def.h, once
+make install        # /usr/local/bin/dcm
 ```
 
-`make check` runs `tests/test_json`, `tests/test_util` and
-`tests/conformance.py --binary ./dcm`. The conformance test creates a fixture
-tree, calls every covered tool and checks the answers.
+The build is C11 with `-Werror`, strict aliasing on, and no `-fwrapv`; arithmetic
+that can wrap is done in unsigned types. `-Wstrict-aliasing=2` is part of the
+flags, and a pointer is never used to read an object of another type.
+
+`make check` runs `tests/test_json`, `tests/test_util`,
+`tests/test_pool.py --binary ./dcm` and `tests/conformance.py --binary ./dcm`.
+The pool test sends 32 requests at once, one of them blocking, and checks that
+the others answer while it runs.
+
+For a special target:
+
+```sh
+make EXTRA="-m32"                                   # a 32-bit client
+make EXTRA="-fsanitize=address,undefined" EXTRA_LDFLAGS="-fsanitize=address,undefined"
+```
+
+The CI runs gcc and clang, a 32-bit job with `gcc-multilib`, a sanitizer job,
+and a job that compares the results with the original.
 
 To compare against the original, build it once (`npm ci && npm run build` in
 its checkout) and run:
@@ -90,24 +133,34 @@ Claude Desktop, `~/.config/Claude/claude_desktop_config.json`:
 ```
 
 Any MCP client that speaks stdio works the same way. There is no setup command,
-no uninstaller and nothing to update.
+no uninstaller, nothing to update and no file to edit after the build.
 
 ## Configuration
 
-`~/.config/desktop-commander/config.json` (or `$XDG_CONFIG_HOME`), read at
-start and written by `set_config_value`:
+The configuration is `src/config.h`. `make` copies it from `src/config.def.h`
+the first time and never touches it again, and git ignores it, so a machine
+keeps its own values while the defaults stay in the tree.
 
-| Key | Default | Meaning |
+| Setting | Default | Meaning |
 | --- | --- | --- |
-| `allowedDirectories` | `[]` | Roots a path must be under. `[]` allows the whole file system. |
-| `blockedCommands` | the original's list | Commands that `start_process` refuses. |
-| `defaultShell` | `$SHELL`, else `/bin/bash` | Shell for `start_process`. |
-| `fileReadLineLimit` | `1000` | Default `length` for `read_file`. |
-| `fileWriteLineLimit` | `50` | Warning threshold for `edit_block`. |
+| `DCM_ALLOWED_DIRECTORIES` | none | Roots a path must be under. Empty allows the whole file system. |
+| `DCM_BLOCKED_COMMANDS` | the original's list | First words that `start_process` refuses. |
+| `DCM_DEFAULT_SHELL` | `""` | Shell for `start_process`; empty takes `$SHELL`, then `/bin/bash`. |
+| `DCM_READ_LINE_LIMIT` | `1000` | Default `length` for `read_file`. |
+| `DCM_WRITE_LINE_LIMIT` | `50` | Warning threshold for `edit_block`. |
+| `DCM_MAX_INFLIGHT` | `32` | Requests accepted before the reader waits. |
+| `DCM_WORKERS` | `8` | Threads that run them. |
+| `DCM_MAX_SESSIONS` | `32` | Process sessions at once. |
+| `DCM_SESSION_BYTES` | `4 MB` | Output kept for each process session. |
+| `DCM_MAX_SEARCHES` | `16` | Search sessions at once. |
+| `DCM_SEARCH_ROWS` | `8192` | Rows kept for each search. |
+| `DCM_SEARCH_BYTES` | `2 MB` | Bytes of rows for each search. |
+| `DCM_REQUEST_NODES` | `65536` | Nodes one request may use. |
 
 Paths are resolved with `realpath` before the check, so a symlink cannot leave
-an allowed directory. `telemetryEnabled` is rejected: there is no telemetry to
-enable.
+an allowed directory. `set_config_value` answers with an error that names
+`src/config.h`: there is no runtime configuration to set. `get_config` reports
+the compiled values, and `telemetry` is `"none"`.
 
 ## Differences from the original
 
@@ -117,6 +170,7 @@ enable.
 - **No PDF, Excel, DOCX or URL reads.** `write_pdf` is not implemented, and
   `read_file` answers `isUrl` with an error that names `curl`/`wget`. The MCP
   UI widgets and the remote device server are not part of this build.
+- **Configuration is compiled in.** No `config.json` is read or written.
 - **Search does not need ripgrep.** The walker is in the binary, so the server
   starts with no download. `.gitignore` is not parsed, so add `includeHidden`
   or a `filePattern` when that matters.
@@ -130,19 +184,18 @@ enable.
 ## Layout
 
 ```
-src/json.c      JSON reader/writer and string buffer
-src/util.c      paths, allowlist, blocklist, file helpers
-src/config.c    config.json, defaults, set_config_value keys
-src/fs.c        the filesystem tools
-src/edit.c      edit_block
-src/search.c    search sessions and the walker
-src/proc.c      process sessions, /proc listing
-src/misc.c      config tools and the local call history
-src/main.c      MCP loop, tool registry and schemas
+src/config.def.h  the build-time configuration, copied to config.h
+src/json.c        JSON arena: nodes, child chunks, string pool
+src/util.c        paths, allowlist, blocklist, file helpers
+src/config.c      the compiled configuration, read once
+src/fs.c          the filesystem tools
+src/edit.c        edit_block
+src/search.c      search sessions and the walker
+src/proc.c        process sessions, the output ring, /proc listing
+src/misc.c        config tools and the local call history
+src/main.c        MCP loop, the worker pool, tool registry and schemas
 ```
 
 ## Licence
 
 MIT, like the original. See `LICENSE`.
-
-From Vigo (an agent)

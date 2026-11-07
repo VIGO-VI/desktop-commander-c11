@@ -1,23 +1,25 @@
 /* SPDX-License-Identifier: MIT
  * Copyright 2026 the Desktop Commander C contributors
  *
- * MCP server over stdio. One JSON-RPC message per line, as the protocol says.
+ * MCP server over stdio: one JSON-RPC message per line. The reader hands each
+ * line to a fixed pool of workers, so a call that waits on a process does not
+ * hold up the next one, and nothing is allocated per request beyond the first
+ * use of a worker's document.
  */
+#include "config.h"
 #include "json.h"
 #include "tools.h"
 #include "util.h"
 
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE
-#endif
 #include <errno.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
-typedef tool_result (*tool_fn)(json *args);
+typedef tool_result (*tool_fn)(jdoc *d, jref args);
 
 typedef struct {
     const char *name;
@@ -34,12 +36,12 @@ typedef struct {
  * caller needs. The schema carries the rest. */
 static const tool_def TOOLS[] = {
     { "get_config", "Get Configuration",
-      "Get the server configuration: blockedCommands, defaultShell, allowedDirectories, "
-      "fileReadLineLimit, fileWriteLineLimit, version, systemInfo.",
+      "Get the build configuration: blockedCommands, defaultShell, "
+      "allowedDirectories, fileReadLineLimit, fileWriteLineLimit, version, systemInfo.",
       "{\"type\":\"object\",\"properties\":{}}", tool_get_config, true, false, false },
 
     { "set_config_value", "Set Configuration Value",
-      "Set one configuration key. allowedDirectories [] means the whole file system.",
+      "Refused: this build takes its configuration at compile time, in src/config.h.",
       "{\"type\":\"object\",\"properties\":{"
       "\"key\":{\"type\":\"string\"},"
       "\"value\":{\"type\":[\"string\",\"number\",\"boolean\",\"array\",\"null\"],"
@@ -225,7 +227,7 @@ static const tool_def TOOLS[] = {
       tool_get_recent_tool_calls, true, false, false },
 };
 
-static const size_t TOOL_COUNT = sizeof TOOLS / sizeof TOOLS[0];
+#define TOOL_COUNT (sizeof TOOLS / sizeof TOOLS[0])
 
 #define INSTRUCTIONS \
     "Desktop Commander: files, search and long-running terminal sessions on this machine. " \
@@ -233,75 +235,21 @@ static const size_t TOOL_COUNT = sizeof TOOLS / sizeof TOOLS[0];
 
 /* ---------------------------------------------------------------- output */
 
-static void send_line(const char *text)
+static pthread_mutex_t g_out = PTHREAD_MUTEX_INITIALIZER;
+
+/* One response is one write, so two workers never interleave a line. */
+static void write_out(sbuf *b)
 {
-    fputs(text, stdout);
-    fputc('\n', stdout);
+    sb_putc(b, '\n');
+    pthread_mutex_lock(&g_out);
+    if (fwrite(b->p, 1, b->n, stdout) != b->n)
+        clearerr(stdout);
     fflush(stdout);
-}
-
-static void send_result(const json *id, json *result)
-{
-    if (!id)
-        return;
-    json *msg = jobj();
-    jobj_set(msg, "jsonrpc", jstr("2.0"));
-    jobj_set(msg, "id", id->t == J_INT ? jint(id->u.i) : jstr(id->t == J_STR ? id->u.s : ""));
-    jobj_set(msg, "result", result);
-    char *text = json_dump(msg, false);
-    send_line(text);
-    free(text);
-    jobj_take(msg, "result"); /* the caller still owns it */
-    json_free(msg);
-}
-
-static void send_error(const json *id, int code, const char *message)
-{
-    json *err = jobj();
-    jobj_set(err, "code", jint(code));
-    jobj_set(err, "message", jstr(message));
-    json *msg = jobj();
-    jobj_set(msg, "jsonrpc", jstr("2.0"));
-    json *idv = jnull();
-    if (id) {
-        json_free(idv);
-        idv = id->t == J_INT ? jint(id->u.i) : jstr(id->t == J_STR ? id->u.s : "");
-    }
-    jobj_set(msg, "id", idv);
-    jobj_set(msg, "error", err);
-    char *text = json_dump(msg, false);
-    send_line(text);
-    free(text);
-    json_free(msg);
+    pthread_mutex_unlock(&g_out);
+    sb_reset(b);
 }
 
 /* ---------------------------------------------------------------- handlers */
-
-static json *tools_list(void)
-{
-    json *arr = jarr();
-    for (size_t i = 0; i < TOOL_COUNT; i++) {
-        const tool_def *t = &TOOLS[i];
-        json *o = jobj();
-        jobj_set(o, "name", jstr(t->name));
-        jobj_set(o, "title", jstr(t->title));
-        jobj_set(o, "description", jstr(t->description));
-        char *err = NULL;
-        json *schema = json_parse(t->schema, strlen(t->schema), &err);
-        free(err);
-        jobj_set(o, "inputSchema", schema ? schema : jobj());
-        json *annot = jobj();
-        jobj_set(annot, "title", jstr(t->title));
-        jobj_set(annot, "readOnlyHint", jbool(t->read_only));
-        jobj_set(annot, "destructiveHint", jbool(t->destructive));
-        jobj_set(annot, "openWorldHint", jbool(t->open_world));
-        jobj_set(o, "annotations", annot);
-        jarr_push(arr, o);
-    }
-    json *root = jobj();
-    jobj_set(root, "tools", arr);
-    return root;
-}
 
 static const tool_def *find_tool(const char *name)
 {
@@ -311,138 +259,267 @@ static const tool_def *find_tool(const char *name)
     return NULL;
 }
 
-static void handle_call(const json *id, json *params)
+static void put_envelope(sbuf *out, jdoc *d, jref id)
 {
-    const char *name = jstr_get(params, "name", NULL);
+    sb_put(out, "{\"jsonrpc\":\"2.0\",\"id\":");
+    json_dump_into(out, d, id, false);
+}
+
+static void reply_result(sbuf *out, jdoc *d, jref id, jref result)
+{
+    put_envelope(out, d, id);
+    sb_put(out, ",\"result\":");
+    json_dump_into(out, d, result, false);
+    sb_putc(out, '}');
+    write_out(out);
+}
+
+static void reply_error(sbuf *out, jdoc *d, jref id, int code, const char *message)
+{
+    put_envelope(out, d, id);
+    sb_printf(out, ",\"error\":{\"code\":%d,\"message\":", code);
+    sb_json_str(out, message);
+    sb_putc(out, '}');
+    sb_putc(out, '}');
+    write_out(out);
+}
+
+/* The tool list is written straight from the table: the schemas are already
+ * JSON text, so nothing is parsed and nothing is copied. */
+static void tools_list(sbuf *out)
+{
+    sb_put(out, "{\"tools\":[");
+    for (size_t i = 0; i < TOOL_COUNT; i++) {
+        const tool_def *t = &TOOLS[i];
+        if (i)
+            sb_putc(out, ',');
+        sb_put(out, "{\"name\":");
+        sb_json_str(out, t->name);
+        sb_put(out, ",\"title\":");
+        sb_json_str(out, t->title);
+        sb_put(out, ",\"description\":");
+        sb_json_str(out, t->description);
+        sb_printf(out, ",\"inputSchema\":%s,\"annotations\":{\"title\":", t->schema);
+        sb_json_str(out, t->title);
+        sb_printf(out, ",\"readOnlyHint\":%s,\"destructiveHint\":%s,\"openWorldHint\":%s}}",
+                  t->read_only ? "true" : "false", t->destructive ? "true" : "false",
+                  t->open_world ? "true" : "false");
+    }
+    sb_put(out, "]}");
+}
+
+static void handle_call(sbuf *out, jdoc *d, jref id, jref params)
+{
+    const char *name = jstr_get(d, params, "name", NULL);
     const tool_def *t = name ? find_tool(name) : NULL;
     if (!t) {
-        send_error(id, -32602, "Unknown tool");
+        reply_error(out, d, id, -32602, "Unknown tool");
         return;
     }
-    json *args = jget(params, "arguments");
-    bool owned = false;
-    if (!args || args->t != J_OBJ) {
-        args = jobj();
-        owned = true;
-    }
+    jref args = jget(d, params, "arguments");
+    if (!jis_obj(d, args))
+        args = jobj(d);
 
-    tool_result r = t->fn(args);
-    history_record(t->name, args, &r);
-    if (owned)
-        json_free(args);
+    tool_result r = t->fn(d, args);
+    history_record(d, t->name, args, &r);
 
-    json *result = jobj();
-    jobj_set(result, "content", r.content);
+    jref result = jobj(d);
+    jobj_set(d, result, "content", r.content);
     if (r.is_error)
-        jobj_set(result, "isError", jbool(true));
-    if (r.structured)
-        jobj_set(result, "structuredContent", r.structured);
-    r.content = NULL;
-    r.structured = NULL;
-    send_result(id, result);
-    json_free(result);
+        jobj_set(d, result, "isError", jbool(d, true));
+    if (r.structured != JNULL)
+        jobj_set(d, result, "structuredContent", r.structured);
+    reply_result(out, d, id, result);
 }
 
-static void handle_initialize(const json *id, json *params)
+static void handle_initialize(sbuf *out, jdoc *d, jref id, jref params)
 {
-    const char *asked = jstr_get(params, "protocolVersion", "2024-11-05");
-    json *caps = jobj();
-    jobj_set(caps, "tools", jobj());
-    jobj_set(caps, "resources", jobj());
-    jobj_set(caps, "prompts", jobj());
-    jobj_set(caps, "logging", jobj());
+    const char *asked = jstr_get(d, params, "protocolVersion", "2024-11-05");
+    jref caps = jobj(d);
+    jobj_set(d, caps, "tools", jobj(d));
+    jobj_set(d, caps, "resources", jobj(d));
+    jobj_set(d, caps, "prompts", jobj(d));
+    jobj_set(d, caps, "logging", jobj(d));
 
-    json *server = jobj();
-    jobj_set(server, "name", jstr("desktop-commander"));
-    jobj_set(server, "version", jstr(DCM_VERSION));
+    jref server = jobj(d);
+    jobj_set(d, server, "name", jstr(d, "desktop-commander"));
+    jobj_set(d, server, "version", jstr(d, DCM_VERSION));
 
-    json *result = jobj();
-    jobj_set(result, "protocolVersion", jstr(asked && *asked ? asked : "2024-11-05"));
-    jobj_set(result, "capabilities", caps);
-    jobj_set(result, "serverInfo", server);
-    jobj_set(result, "instructions", jstr(INSTRUCTIONS));
-    send_result(id, result);
-    json_free(result);
+    jref result = jobj(d);
+    jobj_set(d, result, "protocolVersion", jstr(d, (asked && *asked) ? asked : "2024-11-05"));
+    jobj_set(d, result, "capabilities", caps);
+    jobj_set(d, result, "serverInfo", server);
+    jobj_set(d, result, "instructions", jstr(d, INSTRUCTIONS));
+    reply_result(out, d, id, result);
 }
 
-/* ---------------------------------------------------------------- loop */
-
-static void run(void)
+static void handle_message(jdoc *d, sbuf *out, const char *line, size_t len)
 {
-    char *line = NULL;
-    size_t cap = 0;
-    ssize_t n;
-
-    while ((n = getline(&line, &cap, stdin)) > 0) {
-        while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r'))
-            line[--n] = '\0';
-        if (n == 0)
-            continue;
-
-        char *err = NULL;
-        json *msg = json_parse(line, (size_t)n, &err);
-        if (!msg) {
-            send_error(NULL, -32700, err ? err : "Parse error");
-            free(err);
-            continue;
-        }
-
-        json *id = jget(msg, "id");
-        const char *method = jstr_get(msg, "method", NULL);
-        json *params = jget(msg, "params");
-        if (!params || params->t != J_OBJ)
-            params = NULL;
-
-        if (!method) {
-            /* A response to a request we never send: ignore it. */
-            json_free(msg);
-            continue;
-        }
-
-        if (strcmp(method, "initialize") == 0) {
-            handle_initialize(id, params);
-        } else if (strcmp(method, "notifications/initialized") == 0 ||
-                   strcmp(method, "notifications/cancelled") == 0) {
-            /* no answer */
-        } else if (strcmp(method, "ping") == 0) {
-            json *r = jobj();
-            send_result(id, r);
-        } else if (strcmp(method, "tools/list") == 0) {
-            json *r = tools_list();
-            send_result(id, r);
-            json_free(r);
-        } else if (strcmp(method, "tools/call") == 0) {
-            if (!params)
-                send_error(id, -32602, "Missing params");
-            else
-                handle_call(id, params);
-        } else if (strcmp(method, "resources/list") == 0) {
-            json *r = jobj();
-            jobj_set(r, "resources", jarr());
-            send_result(id, r);
-            json_free(r);
-        } else if (strcmp(method, "prompts/list") == 0) {
-            json *r = jobj();
-            jobj_set(r, "prompts", jarr());
-            send_result(id, r);
-            json_free(r);
-        } else if (strcmp(method, "logging/setLevel") == 0) {
-            json *r = jobj();
-            send_result(id, r);
-            json_free(r);
-        } else if (strcmp(method, "completion/complete") == 0) {
-            json *r = jobj();
-            json *c = jobj();
-            jobj_set(c, "values", jarr());
-            jobj_set(r, "completion", c);
-            send_result(id, r);
-            json_free(r);
-        } else {
-            send_error(id, -32601, "Method not found");
-        }
-        json_free(msg);
+    jref msg = JNULL;
+    const char *err = NULL;
+    if (!json_parse(d, line, len, &msg, &err)) {
+        reply_error(out, d, JNULL, -32700, err ? err : "Parse error");
+        return;
     }
-    free(line);
+
+    jref id = jget(d, msg, "id");
+    const char *method = jstr_get(d, msg, "method", NULL);
+    jref params = jget(d, msg, "params");
+    if (!jis_obj(d, params))
+        params = JNULL;
+
+    if (!method)
+        return; /* a response to a request we never send */
+
+    if (strcmp(method, "initialize") == 0) {
+        handle_initialize(out, d, id, params);
+    } else if (strcmp(method, "notifications/initialized") == 0 ||
+               strcmp(method, "notifications/cancelled") == 0) {
+        return; /* no answer */
+    } else if (strcmp(method, "ping") == 0) {
+        reply_result(out, d, id, jobj(d));
+    } else if (strcmp(method, "tools/list") == 0) {
+        put_envelope(out, d, id);
+        sb_put(out, ",\"result\":");
+        tools_list(out);
+        sb_putc(out, '}');
+        write_out(out);
+    } else if (strcmp(method, "tools/call") == 0) {
+        if (params == JNULL)
+            reply_error(out, d, id, -32602, "Missing params");
+        else
+            handle_call(out, d, id, params);
+    } else if (strcmp(method, "resources/list") == 0 ||
+               strcmp(method, "prompts/list") == 0) {
+        jref r = jobj(d);
+        jobj_set(d, r, strcmp(method, "prompts/list") == 0 ? "prompts" : "resources", jarr(d));
+        reply_result(out, d, id, r);
+    } else if (strcmp(method, "logging/setLevel") == 0) {
+        reply_result(out, d, id, jobj(d));
+    } else if (strcmp(method, "completion/complete") == 0) {
+        jref r = jobj(d);
+        jref c = jobj(d);
+        jobj_set(d, c, "values", jarr(d));
+        jobj_set(d, r, "completion", c);
+        reply_result(out, d, id, r);
+    } else {
+        reply_error(out, d, id, -32601, "Method not found");
+    }
+}
+
+/* ---------------------------------------------------------------- pool */
+
+typedef struct {
+    char *line;
+    size_t len, cap;
+    bool busy;
+} slot;
+
+static slot g_slots[DCM_MAX_INFLIGHT];
+static uint32_t g_queue[DCM_MAX_INFLIGHT];
+static size_t g_head, g_tail, g_count;
+static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_work = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t g_space = PTHREAD_COND_INITIALIZER;
+static bool g_stop;
+
+static void *worker_main(void *arg)
+{
+    (void)arg;
+    jdoc *d = jdoc_new();
+    sbuf out;
+    sb_init(&out);
+
+    for (;;) {
+        pthread_mutex_lock(&g_mu);
+        while (g_count == 0 && !g_stop)
+            pthread_cond_wait(&g_work, &g_mu);
+        if (g_count == 0) {
+            pthread_mutex_unlock(&g_mu);
+            break;
+        }
+        uint32_t i = g_queue[g_head];
+        g_head = (g_head + 1) % DCM_MAX_INFLIGHT;
+        g_count--;
+        pthread_mutex_unlock(&g_mu);
+
+        handle_message(d, &out, g_slots[i].line, g_slots[i].len);
+        /* A method with no reply leaves its text in out for the next call. */
+        sb_reset(&out);
+
+        pthread_mutex_lock(&g_mu);
+        g_slots[i].busy = false;
+        pthread_cond_signal(&g_space);
+        pthread_mutex_unlock(&g_mu);
+    }
+
+    jdoc_free(d);
+    sb_free(&out);
+    return NULL;
+}
+
+/* Waits for a free slot, then copies line into it and wakes a worker. */
+static void submit(const char *line, size_t len)
+{
+    pthread_mutex_lock(&g_mu);
+    size_t i = DCM_MAX_INFLIGHT;
+    for (;;) {
+        for (size_t k = 0; k < DCM_MAX_INFLIGHT; k++) {
+            if (!g_slots[k].busy) {
+                i = k;
+                break;
+            }
+        }
+        if (i < DCM_MAX_INFLIGHT)
+            break;
+        pthread_cond_wait(&g_space, &g_mu);
+    }
+    slot *s = &g_slots[i];
+    if (len + 1 > s->cap) {
+        s->cap = len + 1;
+        s->line = xrealloc(s->line, s->cap);
+    }
+    memcpy(s->line, line, len);
+    s->line[len] = '\0';
+    s->len = len;
+    s->busy = true;
+    g_queue[g_tail] = (uint32_t)i;
+    g_tail = (g_tail + 1) % DCM_MAX_INFLIGHT;
+    g_count++;
+    pthread_cond_signal(&g_work);
+    pthread_mutex_unlock(&g_mu);
+}
+
+static void start_workers(void)
+{
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, DCM_WORKER_STACK);
+    for (int i = 0; i < DCM_WORKERS; i++) {
+        pthread_t t;
+        if (pthread_create(&t, &attr, worker_main, NULL) != 0) {
+            fputs("dcm: cannot start a worker\n", stderr);
+            exit(2);
+        }
+        pthread_detach(t);
+    }
+    pthread_attr_destroy(&attr);
+}
+
+static void drain(void)
+{
+    pthread_mutex_lock(&g_mu);
+    for (;;) {
+        bool busy = false;
+        for (size_t k = 0; k < DCM_MAX_INFLIGHT; k++)
+            busy = busy || g_slots[k].busy;
+        if (!busy)
+            break;
+        pthread_cond_wait(&g_space, &g_mu);
+    }
+    g_stop = true;
+    pthread_cond_broadcast(&g_work);
+    pthread_mutex_unlock(&g_mu);
 }
 
 int main(int argc, char **argv)
@@ -455,14 +532,36 @@ int main(int argc, char **argv)
         if (strcmp(argv[i], "--help") == 0) {
             printf("Usage: %s [--version] [--help]\n\n"
                    "An MCP server over stdio: files, search and terminal sessions.\n"
-                   "Settings: %s/config.json\n",
-                   argv[0], dcm_config_dir());
+                   "Configuration: src/config.h, set at build time.\n",
+                   argv[0]);
             return 0;
         }
     }
 
     signal(SIGPIPE, SIG_IGN);
-    run();
+    start_workers();
+
+    char *line = NULL;
+    size_t cap = 0;
+    ssize_t n;
+    while ((n = getline(&line, &cap, stdin)) > 0) {
+        while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r'))
+            line[--n] = '\0';
+        if (n == 0)
+            continue;
+        if ((size_t)n > DCM_MAX_REQUEST_BYTES) {
+            sbuf e;
+            sb_init(&e);
+            jdoc *d = jdoc_new();
+            reply_error(&e, d, JNULL, -32600, "Request is larger than DCM_MAX_REQUEST_BYTES");
+            jdoc_free(d);
+            sb_free(&e);
+            continue;
+        }
+        submit(line, (size_t)n);
+    }
+    free(line);
+    drain();
     history_shutdown();
     return 0;
 }

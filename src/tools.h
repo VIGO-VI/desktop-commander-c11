@@ -8,47 +8,48 @@
 
 #include <stdbool.h>
 
+/* A tool result lives in the request's document, so nothing is freed here. */
 typedef struct {
-    json *content;    /* array of content blocks, owned */
-    json *structured; /* object or NULL, owned */
+    jref content;    /* array of content blocks */
+    jref structured; /* object, or JNULL */
     bool is_error;
 } tool_result;
 
-tool_result result_text(const char *text);
-tool_result result_error(const char *fmt, ...);
-tool_result result_text_struct(const char *text, json *structured);
-void result_free(tool_result *r);
+tool_result result_text(jdoc *d, const char *text);
+tool_result result_error(jdoc *d, const char *fmt, ...);
+tool_result result_text_struct(jdoc *d, const char *text, jref structured);
 
-/* Each tool takes the parsed arguments object (never NULL) and returns a result. */
-tool_result tool_get_config(json *a);
-tool_result tool_set_config_value(json *a);
-tool_result tool_read_file(json *a);
-tool_result tool_read_multiple_files(json *a);
-tool_result tool_write_file(json *a);
-tool_result tool_create_directory(json *a);
-tool_result tool_list_directory(json *a);
-tool_result tool_move_file(json *a);
-tool_result tool_get_file_info(json *a);
-tool_result tool_edit_block(json *a);
+/* Each tool takes the request document and the arguments object (never
+ * JNULL) and returns a result in the same document. */
+tool_result tool_get_config(jdoc *d, jref a);
+tool_result tool_set_config_value(jdoc *d, jref a);
+tool_result tool_read_file(jdoc *d, jref a);
+tool_result tool_read_multiple_files(jdoc *d, jref a);
+tool_result tool_write_file(jdoc *d, jref a);
+tool_result tool_create_directory(jdoc *d, jref a);
+tool_result tool_list_directory(jdoc *d, jref a);
+tool_result tool_move_file(jdoc *d, jref a);
+tool_result tool_get_file_info(jdoc *d, jref a);
+tool_result tool_edit_block(jdoc *d, jref a);
 
-tool_result tool_start_search(json *a);
-tool_result tool_get_more_search_results(json *a);
-tool_result tool_stop_search(json *a);
-tool_result tool_list_searches(json *a);
+tool_result tool_start_search(jdoc *d, jref a);
+tool_result tool_get_more_search_results(jdoc *d, jref a);
+tool_result tool_stop_search(jdoc *d, jref a);
+tool_result tool_list_searches(jdoc *d, jref a);
 
-tool_result tool_start_process(json *a);
-tool_result tool_read_process_output(json *a);
-tool_result tool_interact_with_process(json *a);
-tool_result tool_force_terminate(json *a);
-tool_result tool_list_sessions(json *a);
-tool_result tool_list_processes(json *a);
-tool_result tool_kill_process(json *a);
+tool_result tool_start_process(jdoc *d, jref a);
+tool_result tool_read_process_output(jdoc *d, jref a);
+tool_result tool_interact_with_process(jdoc *d, jref a);
+tool_result tool_force_terminate(jdoc *d, jref a);
+tool_result tool_list_sessions(jdoc *d, jref a);
+tool_result tool_list_processes(jdoc *d, jref a);
+tool_result tool_kill_process(jdoc *d, jref a);
 
-tool_result tool_get_usage_stats(json *a);
-tool_result tool_get_recent_tool_calls(json *a);
+tool_result tool_get_usage_stats(jdoc *d, jref a);
+tool_result tool_get_recent_tool_calls(jdoc *d, jref a);
 
 /* Shared: record a call for get_usage_stats / get_recent_tool_calls. */
-void history_record(const char *tool, const json *args, const tool_result *r);
+void history_record(jdoc *d, const char *tool, jref args, const tool_result *r);
 void history_shutdown(void);
 
 #endif
