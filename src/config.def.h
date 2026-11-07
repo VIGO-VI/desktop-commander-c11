@@ -32,6 +32,12 @@
 #define DCM_READ_LINE_LIMIT 1000
 #define DCM_WRITE_LINE_LIMIT 50
 
+/* Lines of a process answer that start_process and interact_with_process
+ * return by default: half from the head, half from the tail. The rest stays
+ * readable in the session's output file. A call overrides it with
+ * max_output_lines; a negative value returns every line. */
+#define DCM_OUTPUT_LINES 200
+
 /* Requests accepted before the reader waits: three agents of ten calls each,
  * plus a little. A request beyond this waits for a slot. */
 #define DCM_MAX_INFLIGHT 32
@@ -49,6 +55,9 @@
 /* Process sessions, and the output each keeps. The oldest lines go first. */
 #define DCM_MAX_SESSIONS 32
 #define DCM_SESSION_BYTES (4u * 1024 * 1024)
+/* Bytes of the whole output that one session writes to its file. A command
+ * that prints more keeps the ring only, and the file says where it stopped. */
+#define DCM_SPOOL_BYTES (16u * 1024 * 1024)
 
 /* Search sessions, and the rows each keeps. */
 #define DCM_MAX_SEARCHES 16

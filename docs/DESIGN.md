@@ -42,6 +42,23 @@ signals, so a command that started a server or an SSH connection ends whole.
 On Linux the pipes are `pipe2(O_CLOEXEC)` and the reaper sets
 `PR_SET_CHILD_SUBREAPER`, so orphans of a killed group are reaped here too.
 
+The reader drains the pipe until the process ends, whatever the answer keeps.
+An answer holds `max_output_lines` lines at most: half from the head, half from
+the tail, and one line that says how many were left out. When the output passes
+the default cap the reader opens a file and writes the whole stream to it, from
+the first line, so the middle is one `read_file` away. A cap that closed the
+read end would kill a command that prints more with SIGPIPE, and the reader
+never closes it early.
+
+A wait is a condition variable on the monotonic clock, so a change of the wall
+clock neither stretches nor cuts it. The reader broadcasts on every read, not
+only on a whole line: a prompt with no newline ends the wait, or a REPL would
+look dead for the whole timeout. The unterminated tail lives in the session
+buffer beside the ring, and a page that reaches the end returns it. It comes
+back only when it grew, so a one-line progress bar does not spin the caller.
+The answer of a call moves the unread pointer only past the lines it holds, so
+a capped start does not hide the middle from the next read.
+
 `start_process` first checks the blocklist. It compares the first word of each
 command in the line, and it splits at an unquoted `;`, `|`, `&`, newline,
 backtick or parenthesis, with one pair of quotes removed. This is a guard
@@ -74,7 +91,9 @@ client can read it, and the count of sessions is what bounds the memory.
 A process session keeps its output in a byte ring of `DCM_SESSION_BYTES`
 (4 MB). A new line goes into the free space and the oldest whole lines are
 dropped, so a process that prints for an hour costs the same as one that
-prints a page, and line numbers say how many lines were dropped.
+prints a page, and line numbers say how many lines were dropped. The file of
+the session stops at `DCM_SPOOL_BYTES` (16 MB), so a flood costs a bounded file
+as well as a bounded ring, and the answer says where it stopped.
 
 A search session keeps its rows as NUL-terminated strings in one block of
 `DCM_SEARCH_BYTES`, with an index of 4-byte offsets and a flag bit that marks a

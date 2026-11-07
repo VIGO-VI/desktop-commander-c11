@@ -37,7 +37,8 @@ typedef struct {
 static const tool_def TOOLS[] = {
     { "get_config", "Get Configuration",
       "Get the build configuration: blockedCommands, defaultShell, "
-      "allowedDirectories, fileReadLineLimit, fileWriteLineLimit, version, systemInfo.",
+      "allowedDirectories, fileReadLineLimit, fileWriteLineLimit, maxOutputLines, version, "
+      "systemInfo.",
       "{\"type\":\"object\",\"properties\":{}}", tool_get_config, true, false, false },
 
     { "set_config_value", "Set Configuration Value",
@@ -159,10 +160,12 @@ static const tool_def TOOLS[] = {
 
     { "start_process", "Start Process",
       "Run a shell command and wait up to timeout_ms for output. A command still running "
-      "returns a PID for read_process_output and interact_with_process.",
+      "returns a PID for read_process_output and interact_with_process. The answer keeps the "
+      "first and last max_output_lines lines; the whole output is in the file it names.",
       "{\"type\":\"object\",\"properties\":{"
       "\"command\":{\"type\":\"string\"},"
       "\"timeout_ms\":{\"type\":\"number\"},"
+      "\"max_output_lines\":{\"type\":\"number\",\"default\":200},"
       "\"shell\":{\"type\":\"string\"},"
       "\"verbose_timing\":{\"type\":\"boolean\"}},"
       "\"required\":[\"command\",\"timeout_ms\"]}",
@@ -181,11 +184,13 @@ static const tool_def TOOLS[] = {
       tool_read_process_output, true, false, false },
 
     { "interact_with_process", "Interact With Process",
-      "Send input to a running session and return its new output.",
+      "Send input to a running session and return its new output, capped to max_output_lines "
+      "as head and tail.",
       "{\"type\":\"object\",\"properties\":{"
       "\"pid\":{\"type\":\"number\"},"
       "\"input\":{\"type\":\"string\"},"
       "\"timeout_ms\":{\"type\":\"number\"},"
+      "\"max_output_lines\":{\"type\":\"number\",\"default\":200},"
       "\"wait_for_prompt\":{\"type\":\"boolean\"},"
       "\"verbose_timing\":{\"type\":\"boolean\"}},"
       "\"required\":[\"pid\",\"input\"]}",

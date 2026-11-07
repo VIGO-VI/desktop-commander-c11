@@ -40,6 +40,7 @@ static void cfg_init(void)
     g_cfg.shell = g_shell;
     g_cfg.read_line_limit = DCM_READ_LINE_LIMIT;
     g_cfg.write_line_limit = DCM_WRITE_LINE_LIMIT;
+    g_cfg.output_lines = DCM_OUTPUT_LINES;
 
     size_t n = 0;
     for (size_t i = 0; i + 1 < sizeof k_allowed / sizeof k_allowed[0]; i++) {
@@ -78,6 +79,7 @@ jref config_json(jdoc *d)
     jobj_set(d, o, "defaultShell", jstr(d, c->shell));
     jobj_set(d, o, "fileReadLineLimit", jint(d, c->read_line_limit));
     jobj_set(d, o, "fileWriteLineLimit", jint(d, c->write_line_limit));
+    jobj_set(d, o, "maxOutputLines", jint(d, c->output_lines));
     jobj_set(d, o, "version", jstr(d, DCM_VERSION));
 
     jref sys = jobj(d);
