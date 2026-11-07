@@ -405,8 +405,8 @@ bool str_starts(const char *s, const char *prefix)
 /* ---------------------------------------------------------------- blocklist */
 
 /* True when the first word of a command in the line is in the blocklist.
- * One pass, no allocation: the line is split at unquoted separators, and each
- * first word is compared where it lies. */
+ * One pass, no allocation: the line is split at unquoted separators, a
+ * newline included, and each first word is compared where it lies. */
 bool command_is_blocked(const char *cmd)
 {
     const config *c = cfg();
@@ -428,8 +428,8 @@ bool command_is_blocked(const char *cmd)
         } else if (ch == '"' && !in_single) {
             in_double = !in_double;
         } else if (!in_single && !in_double &&
-                   (ch == '\0' || ch == ';' || ch == '|' || ch == '&' || ch == '`' ||
-                    ch == '(' || ch == ')')) {
+                   (ch == '\0' || ch == '\n' || ch == ';' || ch == '|' || ch == '&' ||
+                    ch == '`' || ch == '(' || ch == ')')) {
             sep = true;
         }
         if (!sep)

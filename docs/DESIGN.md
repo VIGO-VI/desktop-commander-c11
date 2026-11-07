@@ -42,6 +42,12 @@ signals, so a command that started a server or an SSH connection ends whole.
 On Linux the pipes are `pipe2(O_CLOEXEC)` and the reaper sets
 `PR_SET_CHILD_SUBREAPER`, so orphans of a killed group are reaped here too.
 
+`start_process` first checks the blocklist. It compares the first word of each
+command in the line, and it splits at an unquoted `;`, `|`, `&`, newline,
+backtick or parenthesis, with one pair of quotes removed. This is a guard
+against a mistake, not a sandbox: a shell keyword or an assignment before a
+command hides the name, and `start_process` runs the shell it was given.
+
 `list_processes` reads `/proc` directly on Linux: it is the kernel's table and
 needs no fork. Other Unix systems fall back to `ps`.
 
