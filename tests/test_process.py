@@ -148,27 +148,33 @@ def check_cap_argument(server, failures):
 
 
 def check_partial_wait(server, failures):
-    """A prompt with no newline wakes the wait instead of holding it."""
-    text, st, err = server.tool("start_process",
-                                {"command": "printf 'first\\n'; sleep 0.2; printf 'second'",
-                                 "timeout_ms": 50})
+    """A prompt with no newline wakes the wait instead of holding it.
+
+    The line arrives after the start call and the process stays alive after
+    it, so neither the start nor the end of the process can produce it.
+    """
+    text, st, err = server.tool(
+        "start_process",
+        {"command": "sleep 0.5; printf 'second'; sleep 10", "timeout_ms": 100})
     if err:
         failures.append(f"partial start failed: {text}")
         return
     pid = st.get("pid")
+    if "second" in text:
+        failures.append("the tail arrived before the start call returned: " + repr(text))
+
     started = time.monotonic()
-    text, st, err = server.tool("read_process_output", {"pid": pid, "timeout_ms": 5000})
+    text, st, err = server.tool("read_process_output", {"pid": pid, "timeout_ms": 2500})
     waited = time.monotonic() - started
     if "second" not in text:
         failures.append("the wait did not return the line without a newline: " + repr(text))
-    if waited > 2.0:
+    elif waited > 1.8:
         failures.append(f"the wait held for {waited:.2f}s on output it already had")
-    first = text
-    text, st, err = server.tool("read_process_output", {"pid": pid, "timeout_ms": 1000})
+
+    text, st, err = server.tool("read_process_output", {"pid": pid, "timeout_ms": 300})
     if "second" in text:
         failures.append("the same tail came back twice")
-    if first == text:
-        failures.append("the second read repeated the first")
+    server.tool("force_terminate", {"pid": pid})
 
 
 def check_prompt_wait(server, failures):
