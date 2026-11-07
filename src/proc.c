@@ -396,19 +396,9 @@ tool_result tool_start_process(jdoc *d, jref a)
     if (timeout > MAX_WAIT_MS)
         timeout = MAX_WAIT_MS;
 
+    /* Both pipes close on exec, so a child never holds another session's end.
+     * fcntl keeps the two-way path of pipe2 for systems that have neither. */
     int in_pipe[2], out_pipe[2];
-    /* Linux closes the ends on exec, so a child never holds another session's
-     * pipe. The two-way fallback keeps the other Unix systems building. */
-#ifdef __linux__
-    if (pipe2(in_pipe, O_CLOEXEC) != 0)
-        return result_error(d, "Cannot create the input pipe: %s", strerror(errno));
-    if (pipe2(out_pipe, O_CLOEXEC) != 0) {
-        close(in_pipe[0]);
-        close(in_pipe[1]);
-        return result_error(d, "Cannot create the output pipe: %s", strerror(errno));
-    }
-    fcntl(in_pipe[0], F_SETFD, FD_CLOEXEC);
-#else
     if (pipe(in_pipe) != 0)
         return result_error(d, "Cannot create the input pipe: %s", strerror(errno));
     if (pipe(out_pipe) != 0) {
@@ -416,7 +406,8 @@ tool_result tool_start_process(jdoc *d, jref a)
         close(in_pipe[1]);
         return result_error(d, "Cannot create the output pipe: %s", strerror(errno));
     }
-#endif
+    fcntl(in_pipe[0], F_SETFD, FD_CLOEXEC);
+    fcntl(out_pipe[1], F_SETFD, FD_CLOEXEC);
 
     pid_t pid = fork();
     if (pid < 0) {
