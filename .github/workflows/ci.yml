@@ -43,6 +43,7 @@ jobs:
       - name: Run
         run: |
           python3 tests/test_pool.py ./dcm
+          python3 tests/test_process.py ./dcm
           python3 tests/conformance.py --binary ./dcm
 
   compare:

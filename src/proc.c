@@ -9,6 +9,17 @@
  * Output lives in one byte ring per session: the oldest lines go first, and a
  * new byte never moves the rest. Sessions are slots of a static array, so a
  * process costs its buffer and nothing else.
+ *
+ * Two rules keep a flood of output from costing the caller tokens and the
+ * process its life:
+ *
+ * - The reader drains the pipe to the end of the process, always. A capped
+ *   answer stops the reading of nothing: a command that prints past the cap
+ *   reaches its last line instead of dying of SIGPIPE, the way it would if the
+ *   read end were closed.
+ * - A page comes back as head and tail, and the whole output of the session is
+ *   in a file whose path the answer names. The tail carries the error, the
+ *   head carries the start, and the middle is still one read_file away.
  */
 #include "config.h"
 #include "tools.h"
@@ -34,7 +45,9 @@
 
 #define DEFAULT_WAIT_MS 1000
 #define MAX_WAIT_MS 50000
-#define INITIAL_OUTPUT_BYTES (2u * 1024 * 1024)
+/* The unterminated line, held until its newline arrives. A longer line is
+ * flushed in pieces, as before. */
+#define PARTIAL_BYTES 65536
 
 typedef struct {
     bool used;
@@ -51,6 +64,16 @@ typedef struct {
     uint64_t lines_evicted;    /* lines dropped from the front */
     uint64_t unread;           /* absolute index of the first unread line */
 
+    char partial[PARTIAL_BYTES]; /* the tail without its newline yet */
+    size_t plen;
+    uint64_t partial_shown;    /* length of the tail already returned */
+    uint64_t bytes_total;      /* bytes read from the pipe since the start */
+
+    int spool;                 /* file of the whole output, or -1 */
+    char spool_path[PATH_MAX];
+    uint64_t spool_bytes;
+    bool spool_stopped;        /* the file cap or a write error ended it */
+
     bool eof, reaped, killed;
     int wait_status;
     int64_t start_ms, end_ms;
@@ -61,6 +84,7 @@ static psess g_procs[DCM_MAX_SESSIONS];
 static pthread_once_t g_init_once = PTHREAD_ONCE_INIT;
 
 static void *reaper_main(void *arg);
+static uint64_t retained_lines(const psess *s);
 
 static void start_reaper(void)
 {
@@ -128,6 +152,169 @@ static void drop_line(psess *s)
         s->unread = s->lines_evicted;
 }
 
+/* Writes n bytes, and returns false when the target stops taking them. */
+static bool write_all(int fd, const char *p, size_t n)
+{
+    while (n) {
+        ssize_t w = write(fd, p, n);
+        if (w < 0) {
+            if (errno == EINTR)
+                continue;
+            return false;
+        }
+        if (w == 0)
+            return false;
+        p += w;
+        n -= (size_t)w;
+    }
+    return true;
+}
+
+/* Milliseconds on the monotonic clock: a wall-clock jump neither stretches a
+ * wait nor cuts it short. */
+static int64_t mono_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* Waits up to ms on a condition variable, on the monotonic clock. Darwin
+ * takes a relative time; Linux takes an absolute one on the clock the
+ * condition variable counts on. */
+static int cond_wait_ms(pthread_cond_t *cond, pthread_mutex_t *lock, int64_t ms)
+{
+    if (ms < 0)
+        ms = 0;
+    struct timespec t;
+#ifdef __APPLE__
+    t.tv_sec = ms / 1000;
+    t.tv_nsec = (ms % 1000) * 1000000L;
+    return pthread_cond_timedwait_relative_np(cond, lock, &t);
+#else
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    t.tv_sec += ms / 1000;
+    t.tv_nsec += (ms % 1000) * 1000000L;
+    if (t.tv_nsec >= 1000000000L) {
+        t.tv_sec++;
+        t.tv_nsec -= 1000000000L;
+    }
+    return pthread_cond_timedwait(cond, lock, &t);
+#endif
+}
+
+/* A condition variable whose timed wait counts on the monotonic clock. */
+static void cond_init(psess *s)
+{
+#ifndef __APPLE__
+    pthread_condattr_t attr;
+    pthread_condattr_init(&attr);
+    pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+    pthread_cond_init(&s->cond, &attr);
+    pthread_condattr_destroy(&attr);
+#else
+    pthread_cond_init(&s->cond, NULL);
+#endif
+}
+
+/* Lines a session keeps before it starts its output file. */
+static uint64_t spool_after(void)
+{
+    return DCM_OUTPUT_LINES > 0 ? (uint64_t)DCM_OUTPUT_LINES : 1;
+}
+
+/* Writes the retained ring to fd, in the two pieces a ring can have. */
+static bool write_ring(const psess *s, int fd)
+{
+    if (s->bytes == 0)
+        return true;
+    uint32_t room = DCM_SESSION_BYTES - s->rpos;
+    size_t first = s->bytes < room ? s->bytes : room;
+    if (!write_all(fd, s->buf + s->rpos, first))
+        return false;
+    return s->bytes == first || write_all(fd, s->buf, s->bytes - first);
+}
+
+/* Opens the file that holds the whole output and writes what the ring still
+ * keeps, so the file starts at line one even when it opens at the cap. The
+ * name carries both PIDs, and a name that is already taken gets a number.
+ * Caller holds the session lock. */
+static void spool_open(psess *s)
+{
+    if (s->spool >= 0 || s->spool_stopped || s->spool_path[0])
+        return;
+
+    const char *tmp = getenv("TMPDIR");
+    if (!tmp || !*tmp)
+        tmp = "/tmp";
+    size_t tlen = strlen(tmp);
+    bool slash = tmp[tlen - 1] == '/';
+
+    int fd = -1;
+    for (unsigned attempt = 0; attempt < 10 && fd < 0; attempt++) {
+        if (attempt == 0)
+            snprintf(s->spool_path, sizeof s->spool_path, "%s%sdcm-%d-%d.log", tmp,
+                     slash ? "" : "/", (int)getpid(), (int)s->pid);
+        else
+            snprintf(s->spool_path, sizeof s->spool_path, "%s%sdcm-%d-%d-%u.log", tmp,
+                     slash ? "" : "/", (int)getpid(), (int)s->pid, attempt);
+        fd = open(s->spool_path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        if (fd < 0 && errno != EEXIST)
+            break;
+    }
+    if (fd < 0) {
+        s->spool_path[0] = '\0';
+        s->spool_stopped = true;
+        return;
+    }
+    s->spool = fd;
+    s->spool_bytes = s->bytes;
+    if (!write_ring(s, fd))
+        s->spool_stopped = true;
+}
+
+/* Appends a whole line to the output file, up to DCM_SPOOL_BYTES. Caller
+ * holds the session lock. */
+static void spool_append(psess *s, const char *line, size_t len)
+{
+    if (s->spool < 0 || s->spool_stopped)
+        return;
+    if (s->spool_bytes + len + 1 > DCM_SPOOL_BYTES) {
+        s->spool_stopped = true;
+        return;
+    }
+    if (!write_all(s->spool, line, len) || !write_all(s->spool, "\n", 1)) {
+        s->spool_stopped = true;
+        close(s->spool);
+        s->spool = -1;
+        return;
+    }
+    s->spool_bytes += len + 1;
+}
+
+/* Closes the file of a finished session. The index stays in spool_path, so a
+ * later answer can still name it. Caller holds the session lock. */
+static void spool_close(psess *s)
+{
+    if (s->spool >= 0) {
+        close(s->spool);
+        s->spool = -1;
+    }
+}
+
+/* Ends the file of a session whose slot is taken again: its ring goes at the
+ * same time, so the file has no reader left. Caller holds the session lock. */
+static void spool_reset(psess *s)
+{
+    spool_close(s);
+    if (s->spool_path[0]) {
+        unlink(s->spool_path);
+        s->spool_path[0] = '\0';
+    }
+    s->spool_bytes = 0;
+    s->spool_stopped = false;
+}
+
 /* Writes bytes at the head of the ring. Caller holds the session lock. */
 static void ring_write(psess *s, const char *p, size_t n)
 {
@@ -151,16 +338,41 @@ static void line_push(psess *s, const char *line, size_t len)
     ring_write(s, line, len);
     ring_write(s, "\n", 1);
     s->lines_total++;
+
+    /* A short command leaves no file; a flood gets one that starts at its
+     * first line, because the ring is still small when the cap is passed. */
+    if (s->spool < 0 && !s->spool_stopped && !s->spool_path[0] &&
+        s->lines_total > spool_after()) {
+        spool_open(s);
+    } else {
+        spool_append(s, line, len);
+    }
 }
 
 /* ---------------------------------------------------------------- reader */
+
+/* Pushes the unterminated tail as a whole line. When the caller already has it
+ * whole (it did not grow since the answer that returned it), the unread
+ * pointer moves past it, so the same text is not returned twice. Caller holds
+ * the session lock. */
+static void push_tail(psess *s)
+{
+    size_t len = s->plen;
+    if (len && s->partial[len - 1] == '\r')
+        len--;
+    uint64_t idx = s->lines_evicted + retained_lines(s);
+    bool whole = s->plen > 0 && s->plen == s->partial_shown;
+    line_push(s, s->partial, len);
+    if (whole && s->unread >= idx)
+        s->unread = idx + 1;
+    s->plen = 0;
+    s->partial_shown = 0;
+}
 
 static void *reader_main(void *arg)
 {
     psess *s = arg;
     char buf[65536];
-    char partial[65536];
-    size_t plen = 0;
 
     for (;;) {
         ssize_t n = read(s->out_fd, buf, sizeof buf);
@@ -173,33 +385,39 @@ static void *reader_main(void *arg)
             break;
 
         pthread_mutex_lock(&s->lock);
+        s->bytes_total += (uint64_t)n;
         for (ssize_t i = 0; i < n; i++) {
             if (buf[i] == '\n') {
-                size_t len = plen;
-                if (len && partial[len - 1] == '\r')
-                    len--;
-                line_push(s, partial, len);
-                plen = 0;
-            } else if (plen < sizeof partial) {
-                partial[plen++] = buf[i];
+                push_tail(s);
+            } else if (s->plen < sizeof s->partial) {
+                s->partial[s->plen++] = buf[i];
             } else {
-                /* A line longer than the stack buffer: flush it as one. */
-                line_push(s, partial, plen);
-                plen = 0;
-                partial[plen++] = buf[i];
+                /* A line longer than the buffer: flush it as one. */
+                line_push(s, s->partial, s->plen);
+                s->plen = 0;
+                s->partial[s->plen++] = buf[i];
             }
         }
+        /* A byte that is not a whole line yet is still progress, and a waiter
+         * must see it: a prompt has no newline. */
         pthread_cond_broadcast(&s->cond);
         pthread_mutex_unlock(&s->lock);
     }
 
     pthread_mutex_lock(&s->lock);
-    if (plen) {
-        size_t len = plen;
-        if (partial[len - 1] == '\r')
-            len--;
-        line_push(s, partial, len);
+    if (s->plen)
+        push_tail(s);
+    /* Both ends close here, under the lock, before the slot can be taken
+     * again: a reused descriptor number must not be closed by this thread. */
+    if (s->out_fd >= 0) {
+        close(s->out_fd);
+        s->out_fd = -1;
     }
+    if (s->in_fd >= 0) {
+        close(s->in_fd);
+        s->in_fd = -1;
+    }
+    spool_close(s);
     s->eof = true;
     if (s->end_ms == 0)
         s->end_ms = now_ms();
@@ -274,30 +492,10 @@ static uint32_t line_pos(const psess *s, uint64_t i)
     while (n < s->bytes && seen < i) {
         if (s->buf[pos] == '\n')
             seen++;
-        pos = pos + 1 == DCM_SESSION_BYTES ? 0 : pos + 1;
+        pos = ring_next(pos, 1);
         n++;
     }
     return pos;
-}
-
-/* Writes lines [from, from+count) of the retained buffer into out. The lines
- * are stored with their newline; the caller gets them joined by \n. */
-static void ring_page(const psess *s, uint64_t from, uint64_t count, sbuf *out)
-{
-    uint32_t pos = line_pos(s, from);
-    for (uint64_t i = 0; i < count; i++) {
-        if (i)
-            sb_putc(out, '\n');
-        uint32_t start = pos;
-        uint32_t walked = 0;
-        while (walked < s->bytes && s->buf[pos] != '\n') {
-            pos = pos + 1 == DCM_SESSION_BYTES ? 0 : pos + 1;
-            walked++;
-        }
-        uint32_t len = (pos + (pos < start ? DCM_SESSION_BYTES : 0)) - start;
-        ring_copy(s, start, len, out);
-        pos = pos + 1 == DCM_SESSION_BYTES ? 0 : pos + 1;
-    }
 }
 
 static uint64_t retained_lines(const psess *s)
@@ -305,15 +503,85 @@ static uint64_t retained_lines(const psess *s)
     return s->lines_total - s->lines_evicted;
 }
 
-/* Read lines [from, from+count) under the session lock. */
-static void read_page(psess *s, int64_t offset, int64_t length, sbuf *out,
-                      uint64_t *count_out, uint64_t *from_out, uint64_t *total_out,
-                      uint64_t *remaining_out, bool *tail_out, uint64_t *evicted_out)
+/* The lines a reader can see: the whole lines of the ring, and the tail that
+ * has no newline yet. Caller holds the session lock. */
+static uint64_t visible_lines(const psess *s)
 {
-    uint64_t total = retained_lines(s);
+    return retained_lines(s) + (s->plen ? 1u : 0u);
+}
+
+/* Writes visible lines [from, from+count) to out, each with its newline. The
+ * unterminated tail is line retained_lines(). Caller holds the lock. */
+static void write_page(const psess *s, uint64_t from, uint64_t count, sbuf *out)
+{
+    uint64_t complete = retained_lines(s);
+    uint32_t pos = line_pos(s, from);
+    for (uint64_t i = from; i < from + count; i++) {
+        if (i >= complete) {
+            sb_putn(out, s->partial, s->plen);
+            sb_putc(out, '\n');
+            continue;
+        }
+        uint32_t start = pos, len = 0;
+        while (len < s->bytes && s->buf[pos] != '\n') {
+            pos = ring_next(pos, 1);
+            len++;
+        }
+        ring_copy(s, start, len, out);
+        sb_putc(out, '\n');
+        pos = ring_next(pos, 1);
+    }
+}
+
+/* Head and tail of a page, with one line that says how many lines are left out
+ * and where the whole output is. A negative max keeps every line. Returns the
+ * number of lines written, the marker line excluded. */
+static uint64_t write_capped(const psess *s, uint64_t from, uint64_t count, int64_t max,
+                             sbuf *out)
+{
+    if (max < 0 || (uint64_t)max >= count) {
+        write_page(s, from, count, out);
+        return count;
+    }
+    uint64_t head = (uint64_t)max / 2;
+    uint64_t tail = (uint64_t)max - head;
+    uint64_t omitted = count - head - tail;
+    if (head)
+        write_page(s, from, head, out);
+    sb_printf(out, "[... %llu of %llu lines omitted",
+              (unsigned long long)omitted, (unsigned long long)count);
+    if (s->spool_path[0]) {
+        if (s->spool_stopped)
+            sb_printf(out, "; the output up to the file cap of %u bytes is in %s",
+                      (unsigned)DCM_SPOOL_BYTES, s->spool_path);
+        else
+            sb_printf(out, "; the whole output is in %s", s->spool_path);
+    }
+    sb_put(out, " ...]\n");
+    if (tail)
+        write_page(s, from + count - tail, tail, out);
+    return head + tail;
+}
+
+typedef struct {
+    uint64_t from, count, total, remaining, evicted;
+    bool tail;    /* the page was asked for from the end */
+    bool partial; /* the page ends with the unterminated tail */
+} page;
+
+/* Reads a page and, for offset 0, moves the unread pointer. Caller holds the
+ * session lock. */
+static void read_page(psess *s, int64_t offset, int64_t length, sbuf *out, page *p)
+{
+    uint64_t complete = retained_lines(s);
+    uint64_t total = visible_lines(s);
     uint64_t from = 0, count = 0;
-    *tail_out = offset < 0;
-    *evicted_out = s->lines_evicted;
+    bool tail = offset < 0;
+    bool at_end = true;
+
+    p->evicted = s->lines_evicted;
+    p->tail = tail;
+    p->partial = false;
 
     if (offset < 0) {
         uint64_t want = (uint64_t)(-offset);
@@ -323,37 +591,93 @@ static void read_page(psess *s, int64_t offset, int64_t length, sbuf *out,
         count = want;
     } else if (offset == 0) {
         from = s->unread > s->lines_evicted ? s->unread - s->lines_evicted : 0;
-        if (from > total)
-            from = total;
-        uint64_t avail = total - from;
-        count = (uint64_t)length < avail ? (uint64_t)length : avail;
-        s->unread = s->lines_evicted + from + count;
+        if (from > complete)
+            from = complete;
+        uint64_t have = complete - from;
+        count = (uint64_t)length < have ? (uint64_t)length : have;
+        at_end = count == have;
     } else {
         from = (uint64_t)offset < total ? (uint64_t)offset : total;
-        uint64_t avail = total - from;
-        count = (uint64_t)length < avail ? (uint64_t)length : avail;
+        uint64_t have = total - from;
+        count = (uint64_t)length < have ? (uint64_t)length : have;
+        at_end = count == have;
     }
-    *from_out = from;
-    *count_out = count;
-    *total_out = total;
-    *remaining_out = total > from + count ? total - (from + count) : 0;
-    ring_page(s, from, count, out);
+
+    if (!at_end) {
+        /* a page that stops before the end has no tail to show */
+    } else if (tail || offset > 0) {
+        /* An explicit range counts the unterminated tail as a line, and a
+         * reader who asks again gets it again. */
+        if (s->plen && from + count == total) {
+            if (count == 0)
+                from = complete;
+            count++;
+            p->partial = true;
+        }
+    } else if (length > 0 && s->plen > s->partial_shown && from + count == complete) {
+        /* An offset-0 read gets the tail once it grew past the length a
+         * previous answer returned, so a progress bar of one line does not
+         * spin the caller with the same text. */
+        if (count == 0)
+            from = complete;
+        count++;
+        p->partial = true;
+    }
+
+    p->from = from;
+    p->count = count;
+    p->total = total;
+    p->remaining = total > from + count ? total - (from + count) : 0;
+    if (offset == 0 && count) {
+        /* unread counts whole lines only: the tail is returned again, whole,
+         * once its newline arrives. */
+        s->unread = s->lines_evicted + from + count - (p->partial ? 1u : 0u);
+        if (p->partial)
+            s->partial_shown = s->plen;
+    }
+    if (count)
+        write_page(s, from, count, out);
 }
 
-/* Wait until the session is done or new unread output exists. */
-static void wait_for_output(psess *s, int64_t ms)
+/* True when the session has output that an offset-0 reader has not seen.
+ * Caller holds the session lock. */
+static bool has_unread(const psess *s)
 {
-    struct timespec until;
-    clock_gettime(CLOCK_REALTIME, &until);
-    until.tv_sec += ms / 1000;
-    until.tv_nsec += (ms % 1000) * 1000000L;
-    if (until.tv_nsec >= 1000000000L) {
-        until.tv_sec++;
-        until.tv_nsec -= 1000000000L;
+    uint64_t next = s->unread < s->lines_evicted ? s->lines_evicted : s->unread;
+    return next < s->lines_total || s->plen > s->partial_shown;
+}
+
+/* The reader sets eof before the reaper collects the status. Waiting for the
+ * reaper turns a report of "running" into "completed with exit code 0" for a
+ * process that is already gone. Caller holds the session lock. */
+static bool settle_done(psess *s, int64_t ms)
+{
+    int64_t deadline = mono_ms() + ms;
+    while (s->eof && !s->reaped) {
+        int64_t left = deadline - mono_ms();
+        if (left <= 0)
+            break;
+        if (cond_wait_ms(&s->cond, &s->lock, left) == ETIMEDOUT)
+            break;
     }
+    return session_done(s);
+}
+
+/* Waits until the session ends or its output grows past the two counts. The
+ * clock is monotonic, and a byte that is not a whole line yet counts: a prompt
+ * with no newline must wake the wait, or a REPL looks dead for the timeout. */
+static void wait_for_output(psess *s, int64_t ms, uint64_t seen_lines, uint64_t seen_bytes)
+{
+    if (ms <= 0)
+        return;
+    int64_t deadline = mono_ms() + ms;
     pthread_mutex_lock(&s->lock);
-    while (!session_done(s) && s->unread >= s->lines_total) {
-        if (pthread_cond_timedwait(&s->cond, &s->lock, &until) == ETIMEDOUT)
+    while (!session_done(s) && s->lines_total == seen_lines &&
+           s->bytes_total == seen_bytes) {
+        int64_t left = deadline - mono_ms();
+        if (left <= 0)
+            break;
+        if (cond_wait_ms(&s->cond, &s->lock, left) == ETIMEDOUT)
             break;
     }
     pthread_mutex_unlock(&s->lock);
@@ -395,6 +719,8 @@ tool_result tool_start_process(jdoc *d, jref a)
         timeout = 0;
     if (timeout > MAX_WAIT_MS)
         timeout = MAX_WAIT_MS;
+
+    int64_t max_lines = jint_get(d, a, "max_output_lines", cfg()->output_lines);
 
     /* Both pipes close on exec, so a child never holds another session's end.
      * fcntl keeps the two-way path of pipe2 for systems that have neither. */
@@ -450,8 +776,8 @@ tool_result tool_start_process(jdoc *d, jref a)
         if (!s->used) {
             memset(s, 0, sizeof *s);
             pthread_mutex_init(&s->lock, NULL);
-            pthread_cond_init(&s->cond, NULL);
-            s->in_fd = s->out_fd = -1;
+            cond_init(s);
+            s->in_fd = s->out_fd = s->spool = -1;
             s->used = true;
         } else {
             pthread_mutex_lock(&s->lock);
@@ -460,6 +786,10 @@ tool_result tool_start_process(jdoc *d, jref a)
             s->end_ms = 0;
             s->rpos = s->wpos = s->bytes = 0;
             s->lines_total = s->lines_evicted = s->unread = 0;
+            s->plen = 0;
+            s->partial_shown = 0;
+            s->bytes_total = 0;
+            spool_reset(s);
             pthread_mutex_unlock(&s->lock);
         }
         if (!s->buf)
@@ -488,43 +818,62 @@ tool_result tool_start_process(jdoc *d, jref a)
     }
     pthread_attr_destroy(&attr);
 
-    /* Collect the first output, up to the timeout or the initial buffer cap. */
-    int64_t deadline = now_ms() + timeout;
+    /* Collect the first output: until the process ends or the deadline. The
+     * answer is capped below but the reader keeps draining the pipe to the end
+     * of the process, so a command that prints past the cap reaches its last
+     * line instead of dying of SIGPIPE. */
+    int64_t deadline = mono_ms() + timeout;
     pthread_mutex_lock(&s->lock);
-    while (!session_done(s) && s->bytes < INITIAL_OUTPUT_BYTES) {
-        int64_t left = deadline - now_ms();
+    while (!session_done(s)) {
+        int64_t left = deadline - mono_ms();
         if (left <= 0)
             break;
-        struct timespec until;
-        clock_gettime(CLOCK_REALTIME, &until);
-        until.tv_sec += left / 1000;
-        until.tv_nsec += (left % 1000) * 1000000L;
-        if (until.tv_nsec >= 1000000000L) {
-            until.tv_sec++;
-            until.tv_nsec -= 1000000000L;
-        }
-        if (pthread_cond_timedwait(&s->cond, &s->lock, &until) == ETIMEDOUT)
+        if (cond_wait_ms(&s->cond, &s->lock, left) == ETIMEDOUT)
             break;
     }
-    bool done = session_done(s);
-    uint64_t total = retained_lines(s);
+    bool done = settle_done(s, 50);
+    uint64_t total = visible_lines(s);
+
+    /* The whole output goes to a file before the answer is cut, so the middle
+     * is not lost with the lines this answer leaves out. */
+    if (max_lines >= 0 && total > (uint64_t)max_lines)
+        spool_open(s);
 
     sbuf out;
     sb_init(&out);
-    ring_page(s, 0, total, &out);
+    uint64_t shown = write_capped(s, 0, total, max_lines, &out);
+
+    /* A page that holds everything moves the unread pointer; a capped one
+     * moves it past the head, so the next read continues in the middle. */
+    uint64_t head = (max_lines >= 0 && total > (uint64_t)max_lines)
+                        ? (uint64_t)max_lines / 2
+                        : total;
+    if (head == total) {
+        s->unread = s->lines_total;
+        s->partial_shown = s->plen;
+    } else {
+        s->unread = s->lines_evicted + head;
+    }
+
     char ending[128];
     const char *fin = done ? exit_text(s, ending, sizeof ending) : NULL;
     double runtime = runtime_s(s);
+    char file[PATH_MAX];
+    snprintf(file, sizeof file, "%s", s->spool_path);
     pthread_mutex_unlock(&s->lock);
 
     sbuf text;
     sb_init(&text);
-    sb_printf(&text, "Process started with PID %d (shell: %s)\nInitial output:\n%s",
-              (int)pid, shell, out.p ? out.p : "");
+    sb_printf(&text, "Process started with PID %d (shell: %s)\nInitial output:\n",
+              (int)pid, shell);
+    if (out.n)
+        sb_putn(&text, out.p, out.n);
+    else
+        sb_put(&text, "(no output yet)\n");
     if (done && fin) {
-        sb_printf(&text, "\n✅ Process completed with %s (runtime: %.2fs)", fin, runtime);
+        sb_printf(&text, "✅ Process completed with %s (runtime: %.2fs)", fin, runtime);
     } else {
-        sb_put(&text, "\n⏳ Process is running. Use read_process_output to get more output.");
+        sb_put(&text, "⏳ Process is running. Use read_process_output to get more output.");
     }
     sb_free(&out);
 
@@ -532,7 +881,12 @@ tool_result tool_start_process(jdoc *d, jref a)
     jobj_set(d, structured, "pid", jint(d, pid));
     jobj_set(d, structured, "shell", jstr(d, shell));
     jobj_set(d, structured, "status", jstr(d, done ? "finished" : "running"));
-    jobj_set(d, structured, "waitCapped", jbool(d, false));
+    jobj_set(d, structured, "waitCapped", jbool(d, !done));
+    jobj_set(d, structured, "maxOutputLines", jint(d, max_lines));
+    jobj_set(d, structured, "outputLines", jint(d, (int64_t)total));
+    jobj_set(d, structured, "shownLines", jint(d, (int64_t)shown));
+    if (file[0])
+        jobj_set(d, structured, "outputFile", jstr(d, file));
 
     tool_result r = result_text_struct(d, text.p ? text.p : "", structured);
     sb_free(&text);
@@ -558,13 +912,21 @@ tool_result tool_read_process_output(jdoc *d, jref a)
     if (timeout > MAX_WAIT_MS)
         timeout = MAX_WAIT_MS;
 
-    if (offset == 0 && timeout > 0)
-        wait_for_output(s, timeout);
+    if (offset == 0 && timeout > 0) {
+        /* Wait only when nothing is unread: an unread line must not be held
+         * back by the timeout of a call that has an answer already. */
+        pthread_mutex_lock(&s->lock);
+        bool ready = has_unread(s);
+        uint64_t seen_lines = s->lines_total;
+        uint64_t seen_bytes = s->bytes_total;
+        pthread_mutex_unlock(&s->lock);
+        if (!ready)
+            wait_for_output(s, timeout, seen_lines, seen_bytes);
+    }
 
     sbuf out;
     sb_init(&out);
-    uint64_t count = 0, from = 0, total = 0, remaining = 0, evicted = 0;
-    bool tail = false;
+    page p;
 
     pthread_mutex_lock(&s->lock);
     if (s->pid != pid) { /* the slot went to another process meanwhile */
@@ -572,8 +934,8 @@ tool_result tool_read_process_output(jdoc *d, jref a)
         sb_free(&out);
         return result_error(d, "No session found for PID %d", (int)pid);
     }
-    read_page(s, offset, length, &out, &count, &from, &total, &remaining, &tail, &evicted);
-    bool done = session_done(s);
+    read_page(s, offset, length, &out, &p);
+    bool done = settle_done(s, 50);
     char ending[128];
     const char *fin = done ? exit_text(s, ending, sizeof ending) : NULL;
     double runtime = runtime_s(s);
@@ -581,33 +943,37 @@ tool_result tool_read_process_output(jdoc *d, jref a)
 
     sbuf text;
     sb_init(&text);
-    if (tail)
+    if (p.tail)
         sb_printf(&text, "[Reading last %llu lines (total: %llu lines)]",
-                  (unsigned long long)count, (unsigned long long)total);
+                  (unsigned long long)p.count, (unsigned long long)p.total);
     else if (offset == 0) {
-        if (remaining > 0)
+        if (p.remaining > 0)
             sb_printf(&text,
                       "[Reading %llu new lines from line %llu (total: %llu lines, %llu remaining)]",
-                      (unsigned long long)count, (unsigned long long)(from + evicted),
-                      (unsigned long long)total, (unsigned long long)remaining);
+                      (unsigned long long)p.count,
+                      (unsigned long long)(p.from + p.evicted), (unsigned long long)p.total,
+                      (unsigned long long)p.remaining);
         else
             sb_printf(&text, "[Reading %llu new lines (total: %llu lines)]",
-                      (unsigned long long)count, (unsigned long long)total);
+                      (unsigned long long)p.count, (unsigned long long)p.total);
     } else {
         sb_printf(&text,
                   "[Reading %llu lines from line %llu (total: %llu lines, %llu remaining)]",
-                  (unsigned long long)count, (unsigned long long)(from + evicted),
-                  (unsigned long long)total, (unsigned long long)remaining);
+                  (unsigned long long)p.count, (unsigned long long)(p.from + p.evicted),
+                  (unsigned long long)p.total, (unsigned long long)p.remaining);
     }
-    if (evicted)
+    if (p.evicted)
         sb_printf(&text,
                   "\n[WARNING: the output buffer cap evicted %llu early lines; "
                   "line numbers and totals cover the retained buffer only]",
-                  (unsigned long long)evicted);
+                  (unsigned long long)p.evicted);
     sb_put(&text, "\n\n");
-    sb_put(&text, out.n ? out.p : "(No output in requested range)");
+    if (out.n)
+        sb_putn(&text, out.p, out.n);
+    else
+        sb_put(&text, "(No output in requested range)\n");
     if (done && fin)
-        sb_printf(&text, "\n✅ Process completed with %s (runtime: %.2fs)", fin, runtime);
+        sb_printf(&text, "✅ Process completed with %s (runtime: %.2fs)", fin, runtime);
 
     tool_result r = result_buf(d, &text);
     sb_free(&out);
@@ -635,8 +1001,16 @@ tool_result tool_interact_with_process(jdoc *d, jref a)
         return result_error(d, "No session found for PID %d", (int)pid);
     }
     uint64_t before = s->lines_total;
-    int in_fd = s->in_fd;
+    uint64_t seen_lines = s->lines_total;
+    uint64_t seen_bytes = s->bytes_total;
+    /* A copy of the descriptor: the reader closes the session's own end when
+     * the process exits, and the number could then belong to another session. */
+    int in_fd = s->in_fd >= 0 ? dup(s->in_fd) : -1;
     pthread_mutex_unlock(&s->lock);
+    if (in_fd < 0)
+        return result_error(d, "No session found for PID %d: it has ended.", (int)pid);
+
+    int64_t max_lines = jint_get(d, a, "max_output_lines", cfg()->output_lines);
 
     sbuf payload;
     sb_init(&payload);
@@ -657,6 +1031,7 @@ tool_result tool_interact_with_process(jdoc *d, jref a)
         }
         off += (size_t)w;
     }
+    close(in_fd);
     sb_free(&payload);
 
     if (!sent)
@@ -667,20 +1042,34 @@ tool_result tool_interact_with_process(jdoc *d, jref a)
     bool wait_prompt = jbool_get(d, a, "wait_for_prompt", true);
     if (timeout > MAX_WAIT_MS)
         timeout = MAX_WAIT_MS;
-    if (wait_prompt && timeout > 0)
-        wait_for_output(s, timeout);
+    if (wait_prompt)
+        wait_for_output(s, timeout, seen_lines, seen_bytes);
 
     sbuf out;
     sb_init(&out);
     pthread_mutex_lock(&s->lock);
+    uint64_t complete = retained_lines(s);
     uint64_t from = before > s->lines_evicted ? before - s->lines_evicted : 0;
-    uint64_t total = retained_lines(s);
-    if (from > total)
-        from = total;
-    uint64_t count = total - from;
-    ring_page(s, from, count, &out);
-    s->unread = s->lines_total;
-    bool done = session_done(s);
+    if (from > complete)
+        from = complete;
+    uint64_t count = complete - from;
+    if (s->plen)
+        count++; /* the unterminated tail is output too */
+    uint64_t total = visible_lines(s);
+    if (from + count > total)
+        count = total - from;
+    if (max_lines >= 0 && count > (uint64_t)max_lines)
+        spool_open(s);
+    uint64_t shown = write_capped(s, from, count, max_lines, &out);
+    /* Move the unread pointer past what the answer holds. A capped answer
+     * moves it past the head only, so the middle is still readable. */
+    if (shown == count) {
+        s->unread = s->lines_total;
+        s->partial_shown = s->plen;
+    } else {
+        s->unread = s->lines_evicted + from + (uint64_t)max_lines / 2;
+    }
+    bool done = settle_done(s, 50);
     char ending[128];
     const char *fin = done ? exit_text(s, ending, sizeof ending) : NULL;
     double runtime = runtime_s(s);
@@ -688,13 +1077,19 @@ tool_result tool_interact_with_process(jdoc *d, jref a)
 
     sbuf text;
     sb_init(&text);
-    if (out.n)
-        sb_printf(&text, "[%llu new lines]\n\n%s", (unsigned long long)count, out.p);
-    else
-        sb_printf(&text, "✅ Input sent to process %d. No new output within %lld ms.",
+    if (out.n) {
+        if (shown < count)
+            sb_printf(&text, "[%llu new lines, %llu shown]\n",
+                      (unsigned long long)count, (unsigned long long)shown);
+        else
+            sb_printf(&text, "[%llu new lines]\n", (unsigned long long)count);
+        sb_putn(&text, out.p, out.n);
+    } else {
+        sb_printf(&text, "✅ Input sent to process %d. No new output within %lld ms.\n",
                   (int)pid, (long long)timeout);
+    }
     if (done && fin)
-        sb_printf(&text, "\n✅ Process completed with %s (runtime: %.2fs)", fin, runtime);
+        sb_printf(&text, "✅ Process completed with %s (runtime: %.2fs)", fin, runtime);
 
     tool_result r = result_buf(d, &text);
     sb_free(&out);

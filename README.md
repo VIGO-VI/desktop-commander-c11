@@ -59,6 +59,19 @@ REPLs, SSH, database clients and servers all work. `force_terminate` ends the
 group, not just the shell. Output is kept in a ring of `DCM_SESSION_BYTES`, and
 the oldest lines go first, so a process that floods costs a fixed amount.
 
+`start_process` and `interact_with_process` return at most `max_output_lines`
+lines (`DCM_OUTPUT_LINES`, 200 by default): half from the head and half from
+the tail, with one line that says how many are left out. The whole output of
+the session is in a file, and the answer names it, so the middle is one
+`read_file` away. The cap is on the answer only. The reader drains the pipe
+until the process ends, so a command that prints past the cap reaches its last
+line instead of dying of SIGPIPE, the way it would if the read end were closed.
+
+A read waits on the monotonic clock and returns on the first byte, newline or
+not. A prompt with no newline wakes the call at once instead of holding it for
+the whole timeout. A page that ends on such a tail returns it, and returns it
+again only when it grew.
+
 A search is a session too. `start_search` returns at once, a thread walks the
 tree, and `get_more_search_results` pages the rows. Patterns are POSIX extended
 regular expressions, or literal strings with `literalSearch`.
@@ -83,9 +96,11 @@ that can wrap is done in unsigned types. `-Wstrict-aliasing=2` is part of the
 flags, and a pointer is never used to read an object of another type.
 
 `make check` runs `tests/test_json`, `tests/test_util`,
-`tests/test_pool.py --binary ./dcm` and `tests/conformance.py --binary ./dcm`.
-The pool test sends 32 requests at once, one of them blocking, and checks that
-the others answer while it runs.
+`tests/test_pool.py ./dcm`, `tests/test_process.py ./dcm` and
+`tests/conformance.py --binary ./dcm`. The pool test sends 32 requests at once,
+one of them blocking, and checks that the others answer while it runs. The
+process test checks the cap, the output file and a wait that ends on a line
+without a newline.
 
 For a special target:
 
@@ -148,10 +163,12 @@ keeps its own values while the defaults stay in the tree.
 | `DCM_DEFAULT_SHELL` | `""` | Shell for `start_process`; empty takes `$SHELL`, then `/bin/bash`. |
 | `DCM_READ_LINE_LIMIT` | `1000` | Default `length` for `read_file`. |
 | `DCM_WRITE_LINE_LIMIT` | `50` | Warning threshold for `edit_block`. |
+| `DCM_OUTPUT_LINES` | `200` | Lines a process answer returns, half head and half tail. |
 | `DCM_MAX_INFLIGHT` | `32` | Requests accepted before the reader waits. |
 | `DCM_WORKERS` | `8` | Threads that run them. |
 | `DCM_MAX_SESSIONS` | `32` | Process sessions at once. |
 | `DCM_SESSION_BYTES` | `4 MB` | Output kept for each process session. |
+| `DCM_SPOOL_BYTES` | `16 MB` | Output of one session written to its file. |
 | `DCM_MAX_SEARCHES` | `16` | Search sessions at once. |
 | `DCM_SEARCH_ROWS` | `8192` | Rows kept for each search. |
 | `DCM_SEARCH_BYTES` | `2 MB` | Bytes of rows for each search. |
