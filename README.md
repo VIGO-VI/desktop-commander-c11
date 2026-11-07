@@ -67,9 +67,9 @@ directory and `DESKTOP_COMMANDER_DISABLE_TELEMETRY=1`, and compares file
 contents, result sets, tool names and blocklist decisions. Status lines,
 timings, PIDs and session ids differ by design and are not compared.
 
-On this machine the comparison covers 14 of 16 cases. The two search cases are
-skipped because the original refuses to search without a ripgrep binary, which
-this machine does not have. `docs/PARITY.md` lists the cases and the results.
+A machine without ripgrep covers 14 of 16 cases: the original refuses to
+search without it. The CI job installs ripgrep, builds the original, and
+compares all 16. `docs/PARITY.md` lists the cases and the results.
 
 ## Install
 

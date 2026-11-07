@@ -64,9 +64,14 @@ SKIP search_content: the original cannot search here (no ripgrep binary)
 conformance: ok
 ```
 
-14 of 16 cases match the original exactly. The two search cases are checked
-against fixed expectations in the fixture instead; the original needs a
-ripgrep binary that this machine does not have. The CI job installs ripgrep
-and runs the full comparison.
+On a machine with ripgrep installed, all 16 cases match. In the CI job, which
+installs ripgrep and builds the original, the run prints no `SKIP` and no
+`DIFF` line. Without ripgrep the original cannot search, so the two search
+cases are skipped there and our results are checked against fixed
+expectations in the fixture instead.
 
-The same run passes under `-fsanitize=address,undefined`.
+The same run passes under `-fsanitize=address,undefined` on macOS.
+
+The CI runs on Ubuntu with gcc and clang: both build the server, run the unit
+tests, run the 16 cases, and the `compare` job runs all 16 against the
+original.
