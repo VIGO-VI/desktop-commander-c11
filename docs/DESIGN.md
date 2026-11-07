@@ -60,8 +60,10 @@ steady traffic allocates once per worker. A string handle is 4 bytes and never
 zero, so an absent key and the empty string are different.
 
 Sessions are slots of static arrays: `g_procs[DCM_MAX_SESSIONS]` and
-`g_searches[DCM_MAX_SEARCHES]`. A slot is reused when its thread has left, and
-the count of sessions is what bounds the memory.
+`g_searches[DCM_MAX_SEARCHES]`. A process slot is reused only when its reader
+has left and its child was collected, because the reader can still add lines
+after the child exits. The output of a slot that is not finished stays where a
+client can read it, and the count of sessions is what bounds the memory.
 
 A process session keeps its output in a byte ring of `DCM_SESSION_BYTES`
 (4 MB). A new line goes into the free space and the oldest whole lines are

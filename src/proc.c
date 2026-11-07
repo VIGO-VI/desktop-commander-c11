@@ -38,7 +38,6 @@
 
 typedef struct {
     bool used;
-    bool exited; /* the reader has left; the slot may be reused */
     pid_t pid;
     int in_fd, out_fd;
     pthread_t reader;
@@ -203,7 +202,6 @@ static void *reader_main(void *arg)
     s->eof = true;
     if (s->end_ms == 0)
         s->end_ms = now_ms();
-    s->exited = true;
     pthread_cond_broadcast(&s->cond);
     pthread_mutex_unlock(&s->lock);
     return NULL;
@@ -361,7 +359,10 @@ static void wait_for_output(psess *s, int64_t ms)
 
 /* ---------------------------------------------------------------- tools */
 
-/* A free slot, or the oldest finished one. Caller holds g_lock. */
+/* A free slot, or the oldest finished one. Caller holds g_lock. A slot is
+ * finished only when its reader has left and its child was collected: the
+ * reader can still add lines after the child exits, so both are needed. The
+ * fields that say so belong to the session lock. */
 static psess *take_slot(void)
 {
     for (size_t i = 0; i < DCM_MAX_SESSIONS; i++)
@@ -370,7 +371,10 @@ static psess *take_slot(void)
     psess *oldest = NULL;
     for (size_t i = 0; i < DCM_MAX_SESSIONS; i++) {
         psess *s = &g_procs[i];
-        if (s->exited && (!oldest || s->start_ms < oldest->start_ms))
+        pthread_mutex_lock(&s->lock);
+        bool done = session_done(s);
+        pthread_mutex_unlock(&s->lock);
+        if (done && (!oldest || s->start_ms < oldest->start_ms))
             oldest = s;
     }
     return oldest;
@@ -455,7 +459,7 @@ tool_result tool_start_process(jdoc *d, jref a)
             s->used = true;
         } else {
             pthread_mutex_lock(&s->lock);
-            s->eof = s->reaped = s->killed = s->exited = false;
+            s->eof = s->reaped = s->killed = false;
             s->wait_status = 0;
             s->end_ms = 0;
             s->rpos = s->wpos = s->bytes = 0;
@@ -484,6 +488,15 @@ tool_result tool_start_process(jdoc *d, jref a)
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
     if (pthread_create(&s->reader, &attr, reader_main, s) != 0) {
         pthread_attr_destroy(&attr);
+        /* No reader will ever mark the end of this session. Close its pipes,
+         * end the group, and mark the slot finished so it is taken again. */
+        close(s->in_fd);
+        close(s->out_fd);
+        kill(-pid, SIGKILL);
+        kill(pid, SIGKILL);
+        pthread_mutex_lock(&s->lock);
+        s->eof = true;
+        pthread_mutex_unlock(&s->lock);
         return result_error(d, "Cannot start the reader thread");
     }
     pthread_attr_destroy(&attr);
