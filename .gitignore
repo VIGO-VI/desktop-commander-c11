@@ -1,0 +1,15 @@
+# Build output
+/dcm
+*.o
+dcm-asan
+*.dSYM/
+
+# Test binaries
+/tests/test_json
+/tests/test_util
+
+# Editor and OS files
+.DS_Store
+*.swp
+/tests/test_json
+/tests/test_util

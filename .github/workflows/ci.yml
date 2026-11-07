@@ -1,0 +1,41 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    name: build and test (${{ matrix.cc }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: make CC=${{ matrix.cc }}
+      - name: Unit tests and conformance
+        run: make CC=${{ matrix.cc }} check
+
+  compare:
+    name: compare with the original
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ripgrep for the original
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ripgrep
+      - name: Build this server
+        run: make
+      - name: Build the original
+        run: |
+          git clone --depth 1 https://github.com/wonderwhy-er/DesktopCommanderMCP.git /tmp/orig
+          cd /tmp/orig
+          npm ci --ignore-scripts
+          npm run build
+      - name: Run both and compare
+        run: |
+          python3 tests/conformance.py --binary ./dcm \
+            --original /tmp/orig/dist/index.js
