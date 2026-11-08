@@ -29,6 +29,7 @@ static hentry g_hist[DCM_HISTORY_ENTRIES];
 static size_t g_hist_head; /* the slot the next call takes */
 static size_t g_hist_count;
 static size_t g_hist_total;
+static size_t g_hist_ok;
 static int64_t g_started_ms;
 
 /* The newest entry first: entry i is (head - 1 - i) modulo the ring. */
@@ -97,6 +98,8 @@ void history_record(jdoc *d, const char *tool, jref args, const tool_result *r)
     if (g_hist_count < DCM_HISTORY_ENTRIES)
         g_hist_count++;
     g_hist_total++;
+    if (e->ok)
+        g_hist_ok++;
     pthread_mutex_unlock(&g_hist_lock);
 }
 
@@ -137,9 +140,9 @@ tool_result tool_get_usage_stats(jdoc *d, jref a)
 
     pthread_mutex_lock(&g_hist_lock);
     total = (int64_t)g_hist_total;
+    ok = (int64_t)g_hist_ok;
     for (size_t i = 0; i < g_hist_count; i++) {
         hentry *e = hist_at(i);
-        ok += e->ok;
         jobj_set(d, per_tool, e->tool,
                  jint(d, jint_of(d, jget(d, per_tool, e->tool), 0) + 1));
     }

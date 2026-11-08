@@ -12,6 +12,7 @@
 #include "util.h"
 
 #include <errno.h>
+#include <math.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -161,7 +162,7 @@ static const tool_def TOOLS[] = {
     { "start_process", "Start Process",
       "Run a shell command and wait up to timeout_ms for output. A command still running "
       "returns a PID for read_process_output and interact_with_process. The answer keeps the "
-      "first and last max_output_lines lines, and at most maxOutputBytes bytes; the whole "
+      "first and last max_output_lines lines, and at most DCM_OUTPUT_BYTES bytes; the whole "
       "output is in the file it names.",
       "{\"type\":\"object\",\"properties\":{"
       "\"command\":{\"type\":\"string\"},"
@@ -338,9 +339,26 @@ static void handle_call(sbuf *out, jdoc *d, jref id, jref params)
     reply_result(out, d, id, result);
 }
 
+/* The protocol versions this build speaks. A client that asks for one of them
+ * gets it back; anything else gets the newest, which is what the lifecycle
+ * section of the specification asks for. */
+static const char *const PROTOCOL_VERSIONS[] = {
+    "2025-06-18", "2025-03-26", "2024-11-05", "2024-10-07"
+};
+
+static const char *negotiate_version(const char *asked)
+{
+    if (asked) {
+        for (size_t i = 0; i < sizeof PROTOCOL_VERSIONS / sizeof PROTOCOL_VERSIONS[0]; i++)
+            if (strcmp(asked, PROTOCOL_VERSIONS[i]) == 0)
+                return asked;
+    }
+    return PROTOCOL_VERSIONS[0];
+}
+
 static void handle_initialize(sbuf *out, jdoc *d, jref id, jref params)
 {
-    const char *asked = jstr_get(d, params, "protocolVersion", "2024-11-05");
+    const char *asked = jstr_get(d, params, "protocolVersion", NULL);
     jref caps = jobj(d);
     jobj_set(d, caps, "tools", jobj(d));
     jobj_set(d, caps, "resources", jobj(d));
@@ -352,36 +370,55 @@ static void handle_initialize(sbuf *out, jdoc *d, jref id, jref params)
     jobj_set(d, server, "version", jstr(d, DCM_VERSION));
 
     jref result = jobj(d);
-    jobj_set(d, result, "protocolVersion", jstr(d, (asked && *asked) ? asked : "2024-11-05"));
+    jobj_set(d, result, "protocolVersion", jstr(d, negotiate_version(asked)));
     jobj_set(d, result, "capabilities", caps);
     jobj_set(d, result, "serverInfo", server);
     jobj_set(d, result, "instructions", jstr(d, INSTRUCTIONS));
     reply_result(out, d, id, result);
 }
 
-static void handle_message(jdoc *d, sbuf *out, const char *line, size_t len)
+/* True when v can be the id of a request: a string or a number, and not null. */
+static bool id_is_valid(jdoc *d, jref v)
 {
-    jref msg = JNULL;
-    const char *err = NULL;
-    if (!json_parse(d, line, len, &msg, &err)) {
-        reply_error(out, d, JNULL, -32700, err ? err : "Parse error");
+    jtype t = jtype_of(d, v);
+    if (t == J_REAL)
+        return isfinite(jnum_of(d, v)); /* a value with no JSON spelling */
+    return t == J_STR || t == J_INT;
+}
+
+/* One message of the line, already parsed. A message with no id is a
+ * notification: it is run and never answered, whatever its method. */
+static void dispatch_message(jdoc *d, sbuf *out, jref msg)
+{
+    if (!jis_obj(d, msg)) {
+        reply_error(out, d, JNULL, -32600, "Invalid request");
         return;
     }
 
-    jref id = jget(d, msg, "id");
     const char *method = jstr_get(d, msg, "method", NULL);
+    jref id = jget(d, msg, "id");
+    bool has_id = jhas(d, msg, "id");
     jref params = jget(d, msg, "params");
     if (!jis_obj(d, params))
         params = JNULL;
 
-    if (!method)
-        return; /* a response to a request we never send */
+    if (!has_id) {
+        /* A notification: notifications/initialized, notifications/cancelled,
+         * notifications/roots/list_changed and anything else a client sends
+         * cost no line. A reply to a notification is a protocol error. */
+        return;
+    }
+    if (!id_is_valid(d, id)) {
+        reply_error(out, d, JNULL, -32600, "Invalid request: id must be a string or a number");
+        return;
+    }
+    if (!method) {
+        /* A response to a request this server never sends. */
+        return;
+    }
 
     if (strcmp(method, "initialize") == 0) {
         handle_initialize(out, d, id, params);
-    } else if (strcmp(method, "notifications/initialized") == 0 ||
-               strcmp(method, "notifications/cancelled") == 0) {
-        return; /* no answer */
     } else if (strcmp(method, "ping") == 0) {
         reply_result(out, d, id, jobj(d));
     } else if (strcmp(method, "tools/list") == 0) {
@@ -400,6 +437,10 @@ static void handle_message(jdoc *d, sbuf *out, const char *line, size_t len)
         jref r = jobj(d);
         jobj_set(d, r, strcmp(method, "prompts/list") == 0 ? "prompts" : "resources", jarr(d));
         reply_result(out, d, id, r);
+    } else if (strcmp(method, "resources/templates/list") == 0) {
+        jref r = jobj(d);
+        jobj_set(d, r, "resourceTemplates", jarr(d));
+        reply_result(out, d, id, r);
     } else if (strcmp(method, "logging/setLevel") == 0) {
         reply_result(out, d, id, jobj(d));
     } else if (strcmp(method, "completion/complete") == 0) {
@@ -411,6 +452,29 @@ static void handle_message(jdoc *d, sbuf *out, const char *line, size_t len)
     } else {
         reply_error(out, d, id, -32601, "Method not found");
     }
+}
+
+static void handle_message(jdoc *d, sbuf *out, const char *line, size_t len)
+{
+    jref msg = JNULL;
+    const char *err = NULL;
+    if (!json_parse(d, line, len, &msg, &err)) {
+        reply_error(out, d, JNULL, -32700, err ? err : "Parse error");
+        return;
+    }
+
+    if (jis_arr(d, msg)) {
+        /* A batch: the transport of the 2025-03-26 revision allows it, and a
+         * client that still sends one gets each answer on its own line. */
+        if (jlen(d, msg) == 0) {
+            reply_error(out, d, JNULL, -32600, "Invalid request: an empty batch");
+            return;
+        }
+        for (size_t i = 0; i < jlen(d, msg); i++)
+            dispatch_message(d, out, jidx(d, msg, i));
+        return;
+    }
+    dispatch_message(d, out, msg);
 }
 
 /* ---------------------------------------------------------------- pool */
@@ -528,6 +592,58 @@ static void drain(void)
     pthread_mutex_unlock(&g_mu);
 }
 
+/* ---------------------------------------------------------------- input */
+
+/* Reads one line into *buf, without the newline. It never keeps more than
+ * DCM_MAX_REQUEST_BYTES bytes: a longer line is drained as it arrives, so a
+ * client that sends a gigabyte costs no gigabyte. Returns the length, -1 for a
+ * line that was too long, or 0 at end of input. */
+static ssize_t read_request(FILE *f, char **buf, size_t *cap)
+{
+    size_t n = 0;
+    bool over = false;
+    if (*cap == 0) {
+        *cap = 64 * 1024;
+        *buf = xmalloc(*cap);
+    }
+    for (;;) {
+        char *dst;
+        size_t room;
+        if (over) {
+            char scratch[8192];
+            if (!fgets(scratch, sizeof scratch, f))
+                break;
+            if (strchr(scratch, '\n'))
+                break;
+            continue;
+        }
+        if (n + 1 >= *cap) {
+            if (*cap >= DCM_MAX_REQUEST_BYTES) {
+                over = true;
+                continue;
+            }
+            *cap *= 2;
+            *buf = xrealloc(*buf, *cap);
+        }
+        dst = *buf + n;
+        room = *cap - n;
+        if (!fgets(dst, (int)room, f)) {
+            if (n == 0 && !over)
+                return 0;
+            break;
+        }
+        size_t got = strlen(dst);
+        n += got;
+        if (got && dst[got - 1] == '\n')
+            break;
+    }
+    if (over)
+        return -1;
+    while (n && ((*buf)[n - 1] == '\n' || (*buf)[n - 1] == '\r'))
+        (*buf)[--n] = '\0';
+    return (ssize_t)n;
+}
+
 int main(int argc, char **argv)
 {
     for (int i = 1; i < argc; i++) {
@@ -549,24 +665,24 @@ int main(int argc, char **argv)
 
     char *line = NULL;
     size_t cap = 0;
-    ssize_t n;
-    while ((n = getline(&line, &cap, stdin)) > 0) {
-        while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r'))
-            line[--n] = '\0';
+    jdoc *rd = jdoc_new();
+    for (;;) {
+        ssize_t n = read_request(stdin, &line, &cap);
         if (n == 0)
-            continue;
-        if ((size_t)n > DCM_MAX_REQUEST_BYTES) {
+            break;
+        if (n < 0) {
+            /* The line was drained without being kept: a client that sends a
+             * request larger than the cap gets one error and the loop goes on. */
             sbuf e;
             sb_init(&e);
-            jdoc *d = jdoc_new();
-            reply_error(&e, d, JNULL, -32600, "Request is larger than DCM_MAX_REQUEST_BYTES");
-            jdoc_free(d);
+            reply_error(&e, rd, JNULL, -32600, "Request is larger than DCM_MAX_REQUEST_BYTES");
             sb_free(&e);
             continue;
         }
         submit(line, (size_t)n);
     }
     free(line);
+    jdoc_free(rd);
     drain();
     history_shutdown();
     return 0;

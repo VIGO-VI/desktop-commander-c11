@@ -54,12 +54,15 @@ typedef struct {
     uint32_t *offs;    /* DCM_SEARCH_ROWS offsets, high bit = context */
     uint32_t nrows;
     uint32_t bytes;
+    uint32_t too_long; /* entries a path of PATH_MAX bytes could not name */
     int64_t matches;
     bool done;
     bool stopped;
     bool timed_out;
     bool maxed;
     bool exact_hit;
+    bool re_valid;     /* re is compiled for this session */
+    regex_t re;
     int64_t started_ms;
 } ssess;
 
@@ -81,7 +84,10 @@ static void row_push(ssess *s, bool ctx, const char *fmt, ...)
         return;
 
     pthread_mutex_lock(&s->lock);
-    size_t need = (size_t)n + 1;
+    /* vsnprintf returns the length it wanted, not the length it wrote: a row
+     * longer than the buffer must be cut at the buffer, or the copy would read
+     * past it. Paths and lines of a tree reach this far. */
+    size_t need = (size_t)n < sizeof tmp ? (size_t)n + 1 : sizeof tmp;
     if (s->nrows == DCM_SEARCH_ROWS || need > DCM_SEARCH_BYTES - s->bytes) {
         s->maxed = true;
         pthread_mutex_unlock(&s->lock);
@@ -188,14 +194,9 @@ static void content_search_file(ssess *s, const char *path, const char *rel)
         return;
     }
 
-    regex_t re;
-    bool use_re = false;
-    if (!s->literal) {
-        int flags = REG_EXTENDED | REG_NOSUB;
-        if (s->ignore_case)
-            flags |= REG_ICASE;
-        use_re = regcomp(&re, s->pattern, flags) == 0;
-    }
+    /* The pattern is compiled once for the session, not once for each file of
+     * the tree, and a pattern that did not compile was refused at start. */
+    bool use_re = s->re_valid;
 
     /* Line starts, in one block: 4 bytes a line, no pointer per line. */
     uint32_t *lines = NULL;
@@ -222,7 +223,7 @@ static void content_search_file(ssess *s, const char *path, const char *rel)
         const char *line = data + lines[i];
         bool hit;
         if (use_re)
-            hit = regexec(&re, line, 0, NULL, 0) == 0;
+            hit = regexec(&s->re, line, 0, NULL, 0) == 0;
         else if (s->ignore_case)
             hit = contains_ci(line, s->pattern);
         else
@@ -230,9 +231,7 @@ static void content_search_file(ssess *s, const char *path, const char *rel)
 
         if (hit) {
             if (s->context > 0) {
-                int64_t from = (int64_t)i - s->context;
-                if (from < 0)
-                    from = 0;
+                int64_t from = s->context > (int64_t)i ? 0 : (int64_t)i - s->context;
                 for (int64_t k = from; k < (int64_t)i; k++) {
                     if (k > last_shown)
                         row_push(s, true, "%s:%lld · %s", rel, (long long)k + 1, data + lines[k]);
@@ -242,7 +241,8 @@ static void content_search_file(ssess *s, const char *path, const char *rel)
             row_push(s, false, "%s:%zu - %s", rel, i + 1, line);
             last_shown = (int64_t)i;
 
-            int64_t after_end = (int64_t)i + s->context;
+            int64_t after_end = s->context > (int64_t)nlines ? (int64_t)nlines
+                                                           : (int64_t)i + s->context;
             for (int64_t k = (int64_t)i + 1; k <= after_end && k < (int64_t)nlines; k++) {
                 row_push(s, true, "%s:%lld · %s", rel, (long long)k + 1, data + lines[k]);
                 last_shown = k;
@@ -252,8 +252,6 @@ static void content_search_file(ssess *s, const char *path, const char *rel)
         }
     }
 
-    if (use_re)
-        regfree(&re);
     free(lines);
     free(data);
 }
@@ -288,8 +286,16 @@ static void walk(ssess *s, const char *dir, const char *rel)
     for (size_t i = 0; i < n && !sees_stop(s); i++) {
         const char *name = names + i * NAME_MAX_BYTES;
         char full[PATH_MAX], child_rel[PATH_MAX];
-        snprintf(full, sizeof full, "%s/%s", dir, name);
-        snprintf(child_rel, sizeof child_rel, "%s%s%s", *rel ? rel : "", *rel ? "/" : "", name);
+        int nf = snprintf(full, sizeof full, "%s/%s", dir, name);
+        int nr = snprintf(child_rel, sizeof child_rel, "%s%s%s", *rel ? rel : "",
+                          *rel ? "/" : "", name);
+        if (nf < 0 || (size_t)nf >= sizeof full || nr < 0 || (size_t)nr >= sizeof child_rel) {
+            /* A name that PATH_MAX cannot hold would search another path. */
+            pthread_mutex_lock(&s->lock);
+            s->too_long++;
+            pthread_mutex_unlock(&s->lock);
+            continue;
+        }
 
         struct stat st;
         if (lstat(full, &st) != 0)
@@ -400,8 +406,13 @@ tool_result tool_start_search(jdoc *d, jref a)
             pthread_mutex_lock(&s->lock);
             s->done = s->stopped = s->timed_out = s->maxed = s->exact_hit = false;
             s->nrows = s->bytes = 0;
+            s->too_long = 0;
             s->matches = 0;
             s->exited = false;
+            if (s->re_valid) {
+                regfree(&s->re);
+                s->re_valid = false;
+            }
             pthread_mutex_unlock(&s->lock);
         }
         g_seq++;
@@ -422,6 +433,24 @@ tool_result tool_start_search(jdoc *d, jref a)
         if (s->context < 0)
             s->context = 0;
         s->started_ms = now_ms();
+
+        if (s->content && !s->literal) {
+            int flags = REG_EXTENDED | REG_NOSUB | (s->ignore_case ? REG_ICASE : 0);
+            int rc = regcomp(&s->re, s->pattern, flags);
+            if (rc != 0) {
+                char msg[256];
+                regerror(rc, &s->re, msg, sizeof msg);
+                s->done = true;
+                s->exited = true;
+                char *copy = xasprintf("Invalid pattern \"%s\": %s", pattern, msg);
+                pthread_mutex_unlock(&g_sessions_lock);
+                free(root);
+                tool_result r = result_error(d, "%s", copy);
+                free(copy);
+                return r;
+            }
+            s->re_valid = true;
+        }
     }
     pthread_mutex_unlock(&g_sessions_lock);
     free(root);
@@ -448,6 +477,7 @@ tool_result tool_start_search(jdoc *d, jref a)
     size_t shown = s->nrows < 100 ? s->nrows : 100;
     bool done = s->done;
     int64_t matches = s->matches;
+    uint32_t too_long = s->too_long;
 
     sbuf b;
     sb_init(&b);
@@ -457,6 +487,8 @@ tool_result tool_start_search(jdoc *d, jref a)
               (long long)(now_ms() - s->started_ms));
     sb_printf(&b, "Total results: %lld %s\n", (long long)matches,
               matches == 1 ? "match" : "matches");
+    if (too_long)
+        sb_printf(&b, "Skipped %u path(s) longer than PATH_MAX.\n", (unsigned)too_long);
     if (shown > 0) {
         sb_put(&b, "\nInitial results:\n");
         for (size_t i = 0; i < shown; i++)
@@ -491,6 +523,10 @@ tool_result tool_get_more_search_results(jdoc *d, jref a)
         return result_error(d, "Search session %s not found", id);
 
     pthread_mutex_lock(&s->lock);
+    if (strcmp(s->id, id) != 0) {
+        pthread_mutex_unlock(&s->lock);
+        return result_error(d, "Search session %s not found", id);
+    }
     if (!s->done) {
         /* Give a running search a moment to fill this page. */
         struct timespec until;
@@ -515,6 +551,7 @@ tool_result tool_get_more_search_results(jdoc *d, jref a)
     bool exact_hit = s->exact_hit;
     int64_t matches = s->matches;
     int64_t timeout = s->timeout_ms;
+    uint32_t too_long = s->too_long;
 
     sbuf b;
     sb_init(&b);
@@ -548,6 +585,8 @@ tool_result tool_get_more_search_results(jdoc *d, jref a)
             sb_put(&b, "\nStopped early: exact filename match.");
         else
             sb_put(&b, "\nSearch completed.");
+        if (too_long)
+            sb_printf(&b, "\nSkipped %u path(s) longer than PATH_MAX.", (unsigned)too_long);
     }
     pthread_mutex_unlock(&s->lock);
 
@@ -572,6 +611,14 @@ tool_result tool_stop_search(jdoc *d, jref a)
     }
 
     pthread_mutex_lock(&s->lock);
+    if (strcmp(s->id, id) != 0) {
+        pthread_mutex_unlock(&s->lock);
+        sbuf b;
+        sb_init(&b);
+        sb_printf(&b, "Search session %s not found.", id);
+        tool_result r = result_buf(d, &b);
+        return r;
+    }
     bool done = s->done;
     s->stopped = true;
     pthread_cond_broadcast(&s->cond);

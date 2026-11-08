@@ -29,6 +29,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -87,6 +88,47 @@ typedef struct {
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static psess g_procs[DCM_MAX_SESSIONS];
 static pthread_once_t g_init_once = PTHREAD_ONCE_INIT;
+
+/* A pipe whose two ends are close-on-exec, so a later session never inherits
+ * an earlier one's ends: a child that holds the write end of another session's
+ * stdin keeps that session from ever seeing EOF. The child's dup2 clears the
+ * flag on its own standard descriptors. */
+static int make_pipe(int p[2])
+{
+#ifdef __linux__
+    if (pipe2(p, O_CLOEXEC) == 0)
+        return 0;
+#endif
+    if (pipe(p) != 0)
+        return -1;
+    fcntl(p[0], F_SETFD, FD_CLOEXEC);
+    fcntl(p[1], F_SETFD, FD_CLOEXEC);
+    return 0;
+}
+
+/* The environment of a child, built before fork: setenv() allocates, and a
+ * child of a threaded process may only call the async-signal-safe functions
+ * between fork and exec. */
+static char **build_env(void)
+{
+    extern char **environ;
+    size_t n = 0;
+    while (environ && environ[n])
+        n++;
+    char **env = xmalloc((n + 4) * sizeof *env);
+    size_t k = 0;
+    for (size_t i = 0; environ && environ[i]; i++) {
+        if (strncmp(environ[i], "TERM=", 5) == 0 || strncmp(environ[i], "PAGER=", 6) == 0 ||
+            strncmp(environ[i], "GIT_PAGER=", 10) == 0)
+            continue;
+        env[k++] = environ[i];
+    }
+    env[k++] = "TERM=xterm-256color";
+    env[k++] = "PAGER=cat";
+    env[k++] = "GIT_PAGER=cat";
+    env[k] = NULL;
+    return env;
+}
 
 static void *reaper_main(void *arg);
 static uint64_t retained_lines(const psess *s);
@@ -739,9 +781,9 @@ static void read_page(psess *s, int64_t offset, int64_t length, sbuf *out, page 
     p->partial = false;
 
     if (offset < 0) {
-        uint64_t want = (uint64_t)(-offset);
-        if (want > total)
-            want = total;
+        /* -INT64_MIN does not fit an int64. */
+        uint64_t back = offset == INT64_MIN ? (uint64_t)INT64_MAX + 1 : (uint64_t)(-offset);
+        uint64_t want = back > total ? total : back;
         from = total - want;
         count = want;
     } else if (offset == 0) {
@@ -883,21 +925,35 @@ tool_result tool_start_process(jdoc *d, jref a)
 
     int64_t max_lines = jint_get(d, a, "max_output_lines", cfg()->output_lines);
 
-    /* Both pipes close on exec, so a child never holds another session's end.
-     * fcntl keeps the two-way path of pipe2 for systems that have neither. */
+    /* Both pipes close on exec, so a child never holds another session's end. */
     int in_pipe[2], out_pipe[2];
-    if (pipe(in_pipe) != 0)
+    if (make_pipe(in_pipe) != 0)
         return result_error(d, "Cannot create the input pipe: %s", strerror(errno));
-    if (pipe(out_pipe) != 0) {
+    if (make_pipe(out_pipe) != 0) {
         close(in_pipe[0]);
         close(in_pipe[1]);
         return result_error(d, "Cannot create the output pipe: %s", strerror(errno));
     }
-    fcntl(in_pipe[0], F_SETFD, FD_CLOEXEC);
-    fcntl(out_pipe[1], F_SETFD, FD_CLOEXEC);
+
+    /* The argument list and the environment are built here: a threaded process
+     * may only call the async-signal-safe functions between fork and exec. */
+    bool login = strstr(base_name(shell), "bash") || strstr(base_name(shell), "zsh");
+    char *argv[6];
+    argv[0] = (char *)shell;
+    argv[1] = (char *)(login ? "-l" : "-c");
+    if (login) {
+        argv[2] = (char *)"-c";
+        argv[3] = (char *)command;
+        argv[4] = NULL;
+    } else {
+        argv[2] = (char *)command;
+        argv[3] = NULL;
+    }
+    char **envp = build_env();
 
     pid_t pid = fork();
     if (pid < 0) {
+        free(envp);
         close(in_pipe[0]);
         close(in_pipe[1]);
         close(out_pipe[0]);
@@ -914,19 +970,10 @@ tool_result tool_start_process(jdoc *d, jref a)
         close(in_pipe[1]);
         close(out_pipe[0]);
         close(out_pipe[1]);
-
-        setenv("TERM", "xterm-256color", 1);
-        setenv("PAGER", "cat", 1);
-        setenv("GIT_PAGER", "cat", 1);
-
-        const char *base = base_name(shell);
-        if (strstr(base, "bash") || strstr(base, "zsh")) {
-            execl(shell, shell, "-l", "-c", command, (char *)NULL);
-        } else {
-            execl(shell, shell, "-c", command, (char *)NULL);
-        }
+        execve(shell, argv, envp);
         _exit(127);
     }
+    free(envp);
 
     close(in_pipe[0]);
     close(out_pipe[1]);
@@ -1150,6 +1197,38 @@ tool_result tool_read_process_output(jdoc *d, jref a)
     return r;
 }
 
+/* Writes to a pipe without parking a worker forever: a child that never reads
+ * its input fills the pipe, and a blocking write would wait until it exits. */
+static bool write_pipe(int fd, const char *p, size_t n, int64_t ms, size_t *done)
+{
+    int fl = fcntl(fd, F_GETFL);
+    if (fl >= 0)
+        fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    int64_t deadline = mono_ms() + ms;
+    *done = 0;
+    while (*done < n) {
+        ssize_t w = write(fd, p + *done, n - *done);
+        if (w > 0) {
+            *done += (size_t)w;
+            continue;
+        }
+        if (w < 0 && errno == EINTR)
+            continue;
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            int64_t left = deadline - mono_ms();
+            if (left <= 0)
+                return false;
+            struct pollfd pd = {.fd = fd, .events = POLLOUT, .revents = 0};
+            int rc = poll(&pd, 1, left > 1000 ? 1000 : (int)left);
+            if (rc < 0 && errno != EINTR)
+                return false;
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
 tool_result tool_interact_with_process(jdoc *d, jref a)
 {
     pid_t pid = (pid_t)jint_get(d, a, "pid", -1);
@@ -1190,24 +1269,14 @@ tool_result tool_interact_with_process(jdoc *d, jref a)
         sb_putc(&payload, '\n');
 
     size_t off = 0;
-    bool sent = true;
-    while (off < payload.n) {
-        ssize_t w = write(in_fd, payload.p + off, payload.n - off);
-        if (w < 0) {
-            if (errno == EINTR)
-                continue;
-            sent = false;
-            break;
-        }
-        off += (size_t)w;
-    }
+    bool sent = write_pipe(in_fd, payload.p, payload.n, 5000, &off);
+    (void)off;
     close(in_fd);
     sb_free(&payload);
 
     if (!sent)
         return result_error(d, "Failed to send input to process %d. It may have exited.",
                             (int)pid);
-
     int64_t timeout = jint_get(d, a, "timeout_ms", 5000);
     bool wait_prompt = jbool_get(d, a, "wait_for_prompt", true);
     if (timeout > MAX_WAIT_MS)

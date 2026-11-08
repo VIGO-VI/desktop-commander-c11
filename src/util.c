@@ -170,7 +170,7 @@ char *validate_path(const char *path, char **out)
 
 /* ---------------------------------------------------------------- files */
 
-char *read_file_all(const char *path, size_t *len, char **err)
+char *read_file_max(const char *path, size_t cap, size_t *len, char **err)
 {
     *err = NULL;
     FILE *f = fopen(path, "rb");
@@ -182,8 +182,15 @@ char *read_file_all(const char *path, size_t *len, char **err)
     sb_init(&b);
     char tmp[65536];
     size_t n;
-    while ((n = fread(tmp, 1, sizeof tmp, f)) > 0)
+    while ((n = fread(tmp, 1, sizeof tmp, f)) > 0) {
+        if (cap && b.n + n > cap) {
+            *err = xasprintf("%s is larger than %zu bytes", path, cap);
+            fclose(f);
+            sb_free(&b);
+            return NULL;
+        }
         sb_putn(&b, tmp, n);
+    }
     if (ferror(f)) {
         *err = xasprintf("Cannot read %s: %s", path, strerror(errno));
         fclose(f);
@@ -194,6 +201,139 @@ char *read_file_all(const char *path, size_t *len, char **err)
     if (len)
         *len = b.n;
     return sb_take(&b);
+}
+
+char *read_file_all(const char *path, size_t *len, char **err)
+{
+    return read_file_max(path, 0, len, err);
+}
+
+/* Join the lines of a range with one \n each and no trailing newline, the
+ * way the original server's readline-based reader returns them. */
+static char *join_lines_clean(const char *data, size_t len)
+{
+    sbuf b;
+    sb_init(&b);
+    size_t i = 0;
+    while (i < len) {
+        size_t start = i;
+        while (i < len && data[i] != '\n')
+            i++;
+        size_t end = i;
+        if (end > start && data[end - 1] == '\r')
+            end--;
+        if (i < len)
+            i++; /* the newline */
+        if (start == end && i >= len && b.n == 0)
+            break; /* an empty file, or only a final newline */
+        if (b.n || start != 0)
+            sb_putc(&b, '\n');
+        sb_putn(&b, data + start, end - start);
+    }
+    return sb_take(&b);
+}
+
+#define SCAN_BYTES 65536
+
+/* One pass over the whole stream: its line count and whether its last byte is
+ * a newline. A NUL byte ends the text, as strlen() would end a C string. */
+static bool scan_count(FILE *f, int64_t *lines, bool *ends_nl, char **err)
+{
+    char buf[SCAN_BYTES];
+    size_t n;
+    int last = -1;
+    rewind(f);
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) {
+        for (size_t i = 0; i < n; i++) {
+            if (buf[i] == '\0')
+                goto text_end;
+            if (buf[i] == '\n')
+                (*lines)++;
+            last = (unsigned char)buf[i];
+        }
+    }
+text_end:
+    if (ferror(f)) {
+        *err = xasprintf("Cannot read the file: %s", strerror(errno));
+        return false;
+    }
+    *ends_nl = last == '\n';
+    if (last >= 0 && last != '\n')
+        (*lines)++;
+    return true;
+}
+
+/* Reads the lines [offset, offset + length) of an open text stream, without
+ * holding the whole file: two passes, one per line count and one per window,
+ * and memory for the window alone. offset < 0 reads the last |offset| lines,
+ * the way read_file does. *total is the line count of the file and *count the
+ * lines the window holds. */
+char *read_line_window(FILE *f, int64_t offset, int64_t length, int64_t *total,
+                       int64_t *count, bool *tail, char **err)
+{
+    *err = NULL;
+    *total = 0;
+    *count = 0;
+    *tail = offset < 0;
+    bool ends_nl = false;
+    if (!scan_count(f, total, &ends_nl, err))
+        return NULL;
+    (void)ends_nl;
+
+    int64_t start, want;
+    if (offset < 0) {
+        /* -INT64_MIN does not fit an int64. */
+        uint64_t back = offset == INT64_MIN ? (uint64_t)INT64_MAX + 1 : (uint64_t)(-offset);
+        if (back > (uint64_t)*total)
+            back = (uint64_t)*total;
+        want = (int64_t)back;
+        start = *total - want;
+    } else {
+        start = offset > *total ? *total : offset;
+        want = length < 0 ? 0 : length;
+        if (want > *total - start)
+            want = *total - start;
+    }
+    *count = want;
+    if (want == 0)
+        return xstrdup("");
+
+    bool to_end = offset < 0;
+    sbuf b;
+    sb_init(&b);
+    rewind(f);
+    char buf[SCAN_BYTES];
+    size_t n;
+    int64_t line = 0;
+    bool copying = start == 0, done = false;
+    while (!done && (n = fread(buf, 1, sizeof buf, f)) > 0) {
+        for (size_t i = 0; i < n && !done; i++) {
+            char c = buf[i];
+            if (c == '\0') {
+                done = true;
+                break;
+            }
+            if (copying)
+                sb_putc(&b, c);
+            if (c == '\n') {
+                if (copying) {
+                    line++;
+                    if (!to_end && line >= start + want)
+                        done = true;
+                } else if (++line == start) {
+                    copying = true;
+                }
+            }
+        }
+    }
+    if (ferror(f)) {
+        *err = xasprintf("Cannot read the file: %s", strerror(errno));
+        sb_free(&b);
+        return NULL;
+    }
+    char *joined = join_lines_clean(b.p ? b.p : "", b.n);
+    sb_free(&b);
+    return joined;
 }
 
 char *write_file_atomic(const char *path, const char *data, size_t len, bool append,
@@ -302,14 +442,17 @@ char *str_replace_all(const char *hay, const char *from, const char *to,
     size_t flen = strlen(from);
     size_t tlen = strlen(to);
     long long count = 0;
+    if (flen == 0) { /* every position matches, and the count never ends */
+        if (count_out)
+            *count_out = 0;
+        return NULL;
+    }
     for (const char *p = hay; (p = strstr(p, from)) != NULL; p += flen)
         count++;
     if (count_out)
         *count_out = count;
     if (expected >= 0 && count != expected)
         return NULL;
-    if (flen == 0)
-        return xstrdup(hay);
 
     sbuf b;
     sb_init(&b);

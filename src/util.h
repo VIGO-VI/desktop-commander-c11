@@ -8,6 +8,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <sys/types.h>
 
 #define DCM_VERSION "2.0.0"
@@ -40,6 +41,13 @@ char *path_absolute(const char *path);
 char *validate_path(const char *path, char **out);
 
 char *read_file_all(const char *path, size_t *len, char **err);
+/* The same, refusing a file over cap bytes (0 means no cap) so a tool that
+ * needs the whole file cannot be made to allocate a gigabyte. */
+char *read_file_max(const char *path, size_t cap, size_t *len, char **err);
+/* Reads lines [offset, offset + length) of an open text stream with bounded
+ * memory; offset < 0 reads the last |offset| lines. */
+char *read_line_window(FILE *f, int64_t offset, int64_t length, int64_t *total,
+                       int64_t *count, bool *tail, char **err);
 char *write_file_atomic(const char *path, const char *data, size_t len, bool append,
                         mode_t mode, char **err);
 

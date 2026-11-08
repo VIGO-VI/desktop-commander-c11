@@ -15,6 +15,19 @@ $ make
 $ ./dcm          # speaks MCP on stdin/stdout
 ```
 
+## Protocol
+
+MCP over stdio, one JSON-RPC message per line. `initialize` negotiates the
+version: 2025-06-18, 2025-03-26, 2024-11-05 and 2024-10-07 are echoed, and any
+other request gets the newest of them, as the lifecycle section asks.
+
+A message with no `id` is a notification, and it never gets a line back, whatever
+its method: `notifications/initialized`, `notifications/cancelled` and
+`notifications/roots/list_changed` cost nothing. An `id` that JSON-RPC does not
+allow (a null, a boolean, an infinity) gets `-32600`. A batch gets one answer for
+each request it holds and none for its notifications. Every line of stdout is
+valid JSON, so a client can parse it without a repair.
+
 ## Why the rewrite
 
 The original is 15,000 lines of TypeScript and needs Node.js 22, 1,043 npm
@@ -30,12 +43,18 @@ are written once and never moved. Nothing is allocated for each JSON node, each
 line of output or each search row, and a completed request hands its arena back
 for the next one.
 
+`read_file` reads the lines it returns and not the file around them: two passes
+over the stream, one for the line count and one for the window. The last five
+lines of a 90 MB log cost 2 MB of RSS, and the whole-file read of the same log
+cost 99 MB.
+
 | Measure | This build | The previous build of this rewrite |
 | --- | --- | --- |
-| Binary, default `make`, macOS arm64 | 118 KB | 138 KB |
-| Code section | 38 KB | 51 KB |
+| Binary, default `make`, macOS arm64 | 119 KB | 138 KB |
+| Text section, macOS arm64 | 45 KB | 51 KB |
 | Peak RSS, one process that prints 20 MB | 21 MB | 100 MB |
 | Peak RSS, a content search with 50,000 results | 3 MB | 47 MB |
+| Peak RSS, reading 5 lines of a 90 MB log | 2 MB | 99 MB |
 
 A 32-bit build (`make EXTRA=-m32`) uses the same handles of 4 bytes and the same
 `size_t` bounds, so a document, a session slot and a search row cost less there,
@@ -108,11 +127,14 @@ that can wrap is done in unsigned types. `-Wstrict-aliasing=2` is part of the
 flags, and a pointer is never used to read an object of another type.
 
 `make check` runs `tests/test_json`, `tests/test_util`,
-`tests/test_pool.py ./dcm`, `tests/test_process.py ./dcm` and
-`tests/conformance.py --binary ./dcm`. The pool test sends 32 requests at once,
-one of them blocking, and checks that the others answer while it runs. The
-process test checks the cap, the output file and a wait that ends on a line
-without a newline.
+`tests/test_pool.py ./dcm`, `tests/test_process.py ./dcm`,
+`tests/test_protocol.py ./dcm` and `tests/conformance.py --binary ./dcm`. The pool
+test sends 32 requests at once, one of them blocking, and checks that the others
+answer while it runs. The process test checks the cap, the output file and a wait
+that ends on a line without a newline. The protocol test checks that a
+notification is never answered, that an id JSON-RPC does not allow gets -32600,
+that every line is valid JSON, and that a rewrite keeps the mode and the NUL
+bytes of a file.
 
 For a special target:
 
@@ -174,7 +196,8 @@ keeps its own values while the defaults stay in the tree.
 | `DCM_BLOCKED_COMMANDS` | the original's list | First words that `start_process` refuses. A line is split at an unquoted `;`, `|`, `&`, newline, backtick or parenthesis, and each first word is checked. It is a guard, not a sandbox. |
 | `DCM_DEFAULT_SHELL` | `""` | Shell for `start_process`; empty takes `$SHELL`, then `/bin/bash`. |
 | `DCM_READ_LINE_LIMIT` | `1000` | Default `length` for `read_file`. |
-| `DCM_WRITE_LINE_LIMIT` | `50` | Warning threshold for `edit_block`. |
+| `DCM_WRITE_LINE_LIMIT` | `50` | Lines above which `edit_block` warns. |
+| `DCM_MAX_FILE_BYTES` | `64 MB` | Largest file read as a whole: an image, a multiple-file read or the file `edit_block` rewrites. `read_file` streams its window instead. |
 | `DCM_OUTPUT_LINES` | `200` | Lines a process answer returns, half head and half tail. |
 | `DCM_OUTPUT_BYTES` | `32768` | Bytes a process answer returns, a quarter head and the rest tail. |
 | `DCM_MAX_INFLIGHT` | `32` | Requests accepted before the reader waits. |
@@ -210,6 +233,11 @@ the compiled values, and `telemetry` is `"none"`.
 - **Linux first.** `list_processes` reads `/proc`, the reaper is a child
   subreaper (`PR_SET_CHILD_SUBREAPER`) and the pipes are `pipe2(O_CLOEXEC)`.
   A portable `ps` path exists for other Unix systems. Windows is not supported.
+- **A read is a window, not the file.** `read_file` streams the lines it returns,
+  and the whole-file tools stop at `DCM_MAX_FILE_BYTES`.
+- **A write keeps the file it replaces.** `write_file` and `edit_block` keep the
+  mode of the file, and a NUL in the content is a byte of the file rather than
+  its end.
 
 ## Layout
 

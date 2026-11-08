@@ -42,6 +42,17 @@ signals, so a command that started a server or an SSH connection ends whole.
 On Linux the pipes are `pipe2(O_CLOEXEC)` and the reaper sets
 `PR_SET_CHILD_SUBREAPER`, so orphans of a killed group are reaped here too.
 
+All four ends of both pipes are close-on-exec, and the child's `dup2` clears the
+flag on its own standard descriptors. Without that, a later child inherits the
+write end of an earlier session's stdin, and that session never sees EOF. The
+child's argument list and environment are built before the fork, because a
+threaded process may only call the async-signal-safe functions between fork and
+exec, and `setenv` allocates.
+
+A write of input uses a non-blocking descriptor and `poll`, with a five-second
+deadline. A child that never reads its input fills the pipe; a blocking write
+would park one worker forever and the call would never answer.
+
 The reader drains the pipe until the process ends, whatever the answer keeps.
 An answer holds `max_output_lines` lines at most: half from the head, half from
 the tail, and one line that says how many were left out. It also holds
@@ -84,6 +95,15 @@ command hides the name, and `start_process` runs the shell it was given.
 
 `list_processes` reads `/proc` directly on Linux: it is the kernel's table and
 needs no fork. Other Unix systems fall back to `ps`.
+
+A read streams its window in two passes, one for the line count and one for the
+bytes, so memory follows the answer and not the file. A tool that needs the whole
+file stops at `DCM_MAX_FILE_BYTES`.
+
+A write goes through a temporary file in the same directory and a `rename`, so a
+reader never sees half a file. The mode of the file that the write replaces is
+copied onto the new one, and the content is written by its length, because a JSON
+string can hold a NUL byte.
 
 ## Memory
 
@@ -138,6 +158,11 @@ A search thread walks the tree with `opendir`/`lstat`, matching:
 - content: POSIX extended `regcomp`/`regexec`, or a substring for
   `literalSearch`.
 
+The pattern is compiled once for the session, and a pattern that does not compile
+is refused when the search starts instead of quietly becoming a substring search.
+A row is cut at its 1 KB buffer, and a path that `PATH_MAX` cannot hold is counted
+and reported rather than searched under a truncated name.
+
 Files over 32 MB and files with a NUL byte in the first 8 KB are skipped, the
 same kinds of file ripgrep would not print as text. Rows are `path:line - text`
 for a match and `path:line · text` for a context line, so a reader can tell
@@ -148,13 +173,22 @@ lines, so `stop_search` answers within one file, not one tree.
 
 ## Protocol notes
 
-- `initialize` echoes the requested `protocolVersion`, and advertises tools,
-  resources, prompts and logging, all empty but present.
-- Unknown methods get `-32601`; a malformed line gets `-32700` with no id, and
-  a line over `DCM_MAX_REQUEST_BYTES` gets `-32600` without being buffered.
-- Notifications never get an answer.
-- Notifications from the client (`notifications/initialized`,
-  `notifications/cancelled`) are accepted and ignored.
+- `initialize` negotiates the version: it echoes 2025-06-18, 2025-03-26,
+  2024-11-05 or 2024-10-07, and answers the newest for anything else. It
+  advertises tools, resources, prompts and logging, all empty but present.
+- A message with no `id` is a notification. It is dropped without a line, whatever
+  its method, because a reply to a notification is a protocol error and clients
+  send `notifications/roots/list_changed` and `notifications/progress` beside
+  their requests.
+- An `id` that is not a string or a finite number gets `-32600`, and so does a
+  message that is not an object. A response to a request this server never sends
+  is dropped.
+- A batch is answered one request at a time, in the order the workers finish.
+  Clients match an answer by its id, not by its place in the queue.
+- Unknown methods get `-32601`; a malformed line gets `-32700`; a line over
+  `DCM_MAX_REQUEST_BYTES` gets `-32600` and is drained without being kept.
+- The number grammar is the strict one of RFC 8259, and a real that has no JSON
+  spelling (an infinity, a NaN) leaves as `null`, so every line is parseable.
 - The tool list is written from the table: the schemas are JSON text in the
   binary, so a listing parses nothing and copies nothing.
 

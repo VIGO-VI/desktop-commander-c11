@@ -105,6 +105,52 @@ static void test_config(void)
     CHECK(c->read_line_limit > 0 && c->write_line_limit > 0);
 }
 
+/* A file that does not end with a newline keeps its last line whole, and a
+ * window of a big file costs the window, not the file. */
+static void test_line_window(void)
+{
+    const char *path = "/tmp/dcm-test-window.txt";
+    FILE *w = fopen(path, "wb");
+    CHECK(w != NULL);
+    if (!w)
+        return;
+    fputs("one\ntwo\nthree", w); /* no final newline */
+    fclose(w);
+
+    FILE *f = fopen(path, "rb");
+    CHECK(f != NULL);
+    if (f) {
+        int64_t total = 0, count = 0;
+        bool tail = false;
+        char *err = NULL;
+        char *s = read_line_window(f, 0, 1000, &total, &count, &tail, &err);
+        CHECK(total == 3 && count == 3 && !tail);
+        CHECK(s && strcmp(s, "one\ntwo\nthree") == 0);
+        free(s);
+        free(err);
+
+        s = read_line_window(f, -2, 0, &total, &count, &tail, &err);
+        CHECK(tail && count == 2);
+        CHECK(s && strcmp(s, "two\nthree") == 0);
+        free(s);
+        free(err);
+
+        s = read_line_window(f, 1, 1, &total, &count, &tail, &err);
+        CHECK(!tail && count == 1);
+        CHECK(s && strcmp(s, "two") == 0);
+        free(s);
+        free(err);
+
+        s = read_line_window(f, 9, 1, &total, &count, &tail, &err);
+        CHECK(count == 0);
+        CHECK(s && strcmp(s, "") == 0);
+        free(s);
+        free(err);
+        fclose(f);
+    }
+    unlink(path);
+}
+
 int main(void)
 {
     test_lines();
@@ -113,6 +159,7 @@ int main(void)
     test_blocklist();
     test_paths();
     test_config();
+    test_line_window();
     if (failures) {
         fprintf(stderr, "%d util test(s) failed\n", failures);
         return 1;
