@@ -255,7 +255,7 @@ static void test_dump_non_finite(void)
     json_dump_into(&b, d, jreal(d, HUGE_VAL));
     CHECK(b.p && strcmp(b.p, "null") == 0);
     sb_reset(&b);
-    json_dump_into(&b, d, jreal(d, nan("")));
+    json_dump_into(&b, d, jreal(d, NAN));
     CHECK(b.p && strcmp(b.p, "null") == 0);
     sb_reset(&b);
     json_dump_into(&b, d, jreal(d, 1.5));
