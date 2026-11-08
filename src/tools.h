@@ -8,6 +8,13 @@
 
 #include <stdbool.h>
 
+/* A config.h that `make config` wrote before this setting existed does not
+ * define it, and the build of the tool that reads it must still work. The value
+ * in config.def.h wins when it is there. */
+#ifndef DCM_MAX_FILE_BYTES
+#define DCM_MAX_FILE_BYTES (64u * 1024 * 1024)
+#endif
+
 /* A tool result lives in the request's document, so nothing is freed here. */
 typedef struct {
     jref content;    /* array of content blocks */

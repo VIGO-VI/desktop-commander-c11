@@ -84,76 +84,6 @@ static void base64_encode(const unsigned char *data, size_t len, char *dst)
 
 /* ---------------------------------------------------------------- reading */
 
-/* Join the lines of a range with one \n each and no trailing newline, the
- * way the original server's readline-based reader returns them. */
-static char *join_lines_clean(const char *data, size_t len)
-{
-    sbuf b;
-    sb_init(&b);
-    size_t i = 0;
-    while (i < len) {
-        size_t start = i;
-        while (i < len && data[i] != '\n')
-            i++;
-        size_t end = i;
-        if (end > start && data[end - 1] == '\r')
-            end--;
-        if (i < len)
-            i++; /* the newline */
-        if (start == end && i >= len && b.n == 0)
-            break; /* an empty file, or only a final newline */
-        if (b.n || start != 0)
-            sb_putc(&b, '\n');
-        sb_putn(&b, data + start, end - start);
-    }
-    return sb_take(&b);
-}
-
-/* Copy lines [offset, offset+length) of a text into a new string.
- * Returns the count of lines returned. */
-static char *slice_lines(const char *text, int64_t offset, int64_t length,
-                         int64_t total_lines, int64_t *count_out, bool *tail_out)
-{
-    *tail_out = offset < 0;
-    *count_out = 0;
-    if (!text)
-        return xstrdup("");
-
-    if (offset < 0) {
-        /* Tail: the last |offset| lines. */
-        int64_t want = -offset;
-        if (want > total_lines)
-            want = total_lines;
-        int64_t start = total_lines - want;
-        size_t skip = start > 0 ? bytes_for_lines(text, (size_t)start) : 0;
-        *count_out = want;
-        return join_lines_clean(text + skip, strlen(text + skip));
-    }
-
-    if (length < 0)
-        length = 0;
-    size_t start = offset > 0 ? bytes_for_lines(text, (size_t)offset) : 0;
-    if (start >= strlen(text))
-        return xstrdup("");
-
-    const char *p = text + start;
-    int64_t n = 0;
-    size_t bytes = 0;
-    while (*p && n < length) {
-        const char *nl = strchr(p, '\n');
-        if (!nl) {
-            bytes = strlen(p);
-            n++;
-            break;
-        }
-        bytes += (size_t)(nl - p) + 1;
-        p = nl + 1;
-        n++;
-    }
-    *count_out = n;
-    return join_lines_clean(text + start, bytes);
-}
-
 tool_result tool_read_file(jdoc *d, jref a)
 {
     const char *path = jstr_get(d, a, "path", NULL);
@@ -196,18 +126,40 @@ tool_result tool_read_file(jdoc *d, jref a)
         free(abs);
         return r;
     }
+    if (!S_ISREG(st.st_mode)) {
+        /* A device or a pipe can block the read forever, and neither is text. */
+        tool_result r = result_error(d, "Cannot read %s: it is not a regular file", path);
+        free(abs);
+        return r;
+    }
 
-    size_t len = 0;
-    char *data = read_file_all(abs, &len, &err);
-    if (!data) {
-        tool_result r = result_error(d, "%s", err);
-        free(err);
+    FILE *f = fopen(abs, "rb");
+    if (!f) {
+        tool_result r = result_error(d, "Cannot read %s: %s", path, strerror(errno));
         free(abs);
         return r;
     }
 
     /* Images travel as an image block so the model can see them. */
     if (file_is_image(abs)) {
+        if ((uint64_t)st.st_size > (uint64_t)DCM_MAX_FILE_BYTES) {
+            char msg[PATH_MAX + 96];
+            snprintf(msg, sizeof msg,
+                     "Cannot read %s as an image: it is larger than %u bytes",
+                     path, (unsigned)DCM_MAX_FILE_BYTES);
+            fclose(f);
+            free(abs);
+            return result_error(d, "%s", msg);
+        }
+        size_t len = 0;
+        char *data = read_file_max(abs, DCM_MAX_FILE_BYTES, &len, &err);
+        fclose(f);
+        if (!data) {
+            tool_result r = result_error(d, "%s", err);
+            free(err);
+            free(abs);
+            return r;
+        }
         size_t blen = ((len + 2) / 3) * 4 + 1;
         char *b64 = xmalloc(blen);
         base64_encode((const unsigned char *)data, len, b64);
@@ -229,17 +181,24 @@ tool_result tool_read_file(jdoc *d, jref a)
         return (tool_result){content, JNULL, false};
     }
 
-    if (data_is_binary(data, len)) {
-        free(data);
+    char probe[8000];
+    size_t got = fread(probe, 1, sizeof probe, f);
+    if (data_is_binary(probe, got)) {
+        fclose(f);
         free(abs);
         return result_error(d, "Cannot read %s as text: the file is binary", path);
     }
 
-    int64_t total = (int64_t)count_lines(data);
-    int64_t count = 0;
+    int64_t total = 0, count = 0;
     bool tail = false;
-    char *slice = slice_lines(data, offset, length, total, &count, &tail);
-    free(data);
+    char *slice = read_line_window(f, offset, length, &total, &count, &tail, &err);
+    fclose(f);
+    if (!slice) {
+        tool_result r = result_error(d, "%s", err);
+        free(err);
+        free(abs);
+        return r;
+    }
 
     sbuf b;
     sb_init(&b);
@@ -290,7 +249,7 @@ tool_result tool_read_multiple_files(jdoc *d, jref a)
             continue;
         }
         size_t len = 0;
-        char *data = read_file_all(abs, &len, &err);
+        char *data = read_file_max(abs, DCM_MAX_FILE_BYTES, &len, &err);
         if (!data) {
             if (i)
                 sb_putc(&summary, '\n');
@@ -358,7 +317,8 @@ tool_result tool_write_file(jdoc *d, jref a)
     jref cv = jget(d, a, "content");
     if (!jis_str(d, cv))
         return result_error(d, "content must be a string");
-    const char *text = jstr_of(d, cv);
+    size_t clen = 0;
+    const char *text = jstrn_of(d, cv, &clen);
 
     bool mode_given = jget(d, a, "mode") != JNULL;
     const char *mode = jstr_get(d, a, "mode", "rewrite");
@@ -374,21 +334,23 @@ tool_result tool_write_file(jdoc *d, jref a)
         return r;
     }
 
-    if (!mode_given) {
-        struct stat st;
-        if (stat(abs, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0) {
-            tool_result r = result_error(
-                d,
-                "Write rejected: %s already has content (%lld bytes) and no mode was given. "
-                "Retry with mode 'append' or mode 'rewrite'.",
-                path, (long long)st.st_size);
-            free(abs);
-            return r;
-        }
+    /* A mode of its own keeps the file it replaces: an edit of a script must
+     * not clear its execute bit. */
+    struct stat st;
+    bool exists = stat(abs, &st) == 0;
+    mode_t fmode = (exists && S_ISREG(st.st_mode)) ? (st.st_mode & 07777) : 0644;
+
+    if (!mode_given && exists && S_ISREG(st.st_mode) && st.st_size > 0) {
+        tool_result r = result_error(
+            d,
+            "Write rejected: %s already has content (%lld bytes) and no mode was given. "
+            "Retry with mode 'append' or mode 'rewrite'.",
+            path, (long long)st.st_size);
+        free(abs);
+        return r;
     }
 
-    int64_t lines = (int64_t)count_lines(text);
-    char *out = write_file_atomic(abs, text, strlen(text), append, 0644, &err);
+    char *out = write_file_atomic(abs, text, clen, append, fmode, &err);
     if (!out) {
         tool_result r = result_error(d, "%s", err);
         free(err);
@@ -398,6 +360,7 @@ tool_result tool_write_file(jdoc *d, jref a)
     free(out);
 
     char msg[PATH_MAX + 64];
+    int64_t lines = (int64_t)count_lines(text);
     snprintf(msg, sizeof msg, "Successfully %s %s (%lld lines)",
              append ? "appended to" : "wrote to", path, (long long)lines);
     tool_result r = result_text(d, msg);
@@ -525,7 +488,9 @@ static void list_recursive(jdoc *d, sbuf *out, const char *dir, int depth, const
     for (size_t i = 0; i < show; i++) {
         const char *name = names + i * NAME_MAX_BYTES;
         char full[PATH_MAX];
-        snprintf(full, sizeof full, "%s/%s", dir, name);
+        int fn = snprintf(full, sizeof full, "%s/%s", dir, name);
+        if (fn < 0 || (size_t)fn >= sizeof full)
+            continue; /* a name that PATH_MAX cannot hold is not this entry */
         struct stat st;
         bool isdir = false;
         if (lstat(full, &st) == 0) {

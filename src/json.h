@@ -58,6 +58,11 @@ int64_t jint_of(const jdoc *d, jref v, int64_t dflt);
 bool jbool_of(const jdoc *d, jref v);
 
 jref jget(jdoc *d, jref obj, const char *k);
+/* True when k is present, even with the value null. */
+bool jhas(jdoc *d, jref obj, const char *k);
+/* The bytes of a string and their count. A string may hold a NUL, so the count
+ * is what a writer must use. */
+const char *jstrn_of(const jdoc *d, jref v, size_t *len);
 const char *jstr_get(jdoc *d, jref obj, const char *k, const char *dflt);
 int64_t jint_get(jdoc *d, jref obj, const char *k, int64_t dflt);
 double jnum_get(jdoc *d, jref obj, const char *k, double dflt);

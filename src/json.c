@@ -12,6 +12,8 @@
 #include "json.h"
 
 #include <inttypes.h>
+#include <errno.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -311,26 +313,33 @@ jref jnull(jdoc *d) { (void)d; return JNULL; }
 jref jarr(jdoc *d) { return node_new(d, J_ARR); }
 jref jobj(jdoc *d) { return node_new(d, J_OBJ); }
 
+/* node_new returns JNULL when the document is full, and node 0 is the null
+ * node of every document: a value that could not be built must leave it
+ * alone. */
 jref jbool(jdoc *d, bool b)
 {
     jref r = node_new(d, J_BOOL);
-    d->nodes[r].n = b != 0;
+    if (r != JNULL)
+        d->nodes[r].n = b != 0;
     return r;
 }
 
 jref jint(jdoc *d, int64_t i)
 {
     jref r = node_new(d, J_INT);
-    d->nodes[r].num = i;
+    if (r != JNULL)
+        d->nodes[r].num = i;
     return r;
 }
 
 jref jreal(jdoc *d, double x)
 {
     jref r = node_new(d, J_REAL);
-    uint64_t bits;
-    memcpy(&bits, &x, sizeof bits);
-    d->nodes[r].num = (int64_t)bits;
+    if (r != JNULL) {
+        uint64_t bits;
+        memcpy(&bits, &x, sizeof bits);
+        d->nodes[r].num = (int64_t)bits;
+    }
     return r;
 }
 
@@ -488,13 +497,38 @@ bool jbool_of(const jdoc *d, jref v) { return jtype_of(d, v) == J_BOOL && d->nod
 int64_t jint_of(const jdoc *d, jref v, int64_t dflt)
 {
     jtype t = jtype_of(d, v);
-    return t == J_INT ? d->nodes[v].num : t == J_REAL ? (int64_t)jnum_of(d, v) : dflt;
+    if (t == J_INT)
+        return d->nodes[v].num;
+    if (t != J_REAL)
+        return dflt;
+    /* A cast of a real outside the range of int64 is undefined behaviour, and a
+     * client is free to send 1e300 as a timeout. */
+    double x = jnum_of(d, v);
+    if (!isfinite(x) || x >= 9223372036854775808.0 || x < -9223372036854775808.0)
+        return dflt;
+    return (int64_t)x;
 }
 
 jref jget(jdoc *d, jref o, const char *k)
 {
     uint32_t i = obj_index(d, o, k);
     return i < jlen(d, o) ? ent_cat(d, d->nodes[o].a - 1, i)->v : JNULL;
+}
+
+bool jhas(jdoc *d, jref o, const char *k)
+{
+    return obj_index(d, o, k) < jlen(d, o);
+}
+
+const char *jstrn_of(const jdoc *d, jref v, size_t *len)
+{
+    if (len)
+        *len = 0;
+    if (jtype_of(d, v) != J_STR)
+        return "";
+    if (len)
+        *len = d->nodes[v].n;
+    return str_at(d, d->nodes[v].a);
 }
 
 const char *jstr_get(jdoc *d, jref o, const char *k, const char *dflt)
@@ -592,7 +626,7 @@ static bool hex4(parser *ps, unsigned *v)
 /* Reads one \\uXXXX at ps->p, with ps->p just past the 'u'. */
 static bool read_uescape(parser *ps, unsigned *cp)
 {
-    unsigned v, lo;
+    unsigned v = 0, lo = 0;
     if (!hex4(ps, &v))
         return false;
     *cp = v;
@@ -673,7 +707,7 @@ static bool measure_string(parser *ps, size_t *out)
     return perr(ps, "unterminated string");
 }
 
-static bool parse_string(parser *ps, uint32_t *handle)
+static bool parse_string(parser *ps, uint32_t *handle, size_t *len)
 {
     if (ps->p >= ps->end || *ps->p != '"')
         return perr(ps, "expected string");
@@ -712,20 +746,35 @@ static bool parse_string(parser *ps, uint32_t *handle)
     ps->p++;
     *w = '\0';
     *handle = str_handle(ps->d, dst);
+    if (len)
+        *len = n;
     return true;
 }
 
+/* RFC 8259 number: -? (0 | [1-9][0-9]*) (. [0-9]+)? ([eE] [+-]? [0-9]+)? */
 static jref parse_number(parser *ps)
 {
     const char *start = ps->p;
     bool real = false;
     if (ps->p < ps->end && *ps->p == '-')
         ps->p++;
-    while (ps->p < ps->end && *ps->p >= '0' && *ps->p <= '9')
+    if (ps->p >= ps->end || *ps->p < '0' || *ps->p > '9') {
+        perr(ps, "expected value");
+        return JNULL;
+    }
+    if (*ps->p == '0') {
         ps->p++;
+    } else {
+        while (ps->p < ps->end && *ps->p >= '0' && *ps->p <= '9')
+            ps->p++;
+    }
     if (ps->p < ps->end && *ps->p == '.') {
         real = true;
         ps->p++;
+        if (ps->p >= ps->end || *ps->p < '0' || *ps->p > '9') {
+            perr(ps, "bad number");
+            return JNULL;
+        }
         while (ps->p < ps->end && *ps->p >= '0' && *ps->p <= '9')
             ps->p++;
     }
@@ -734,24 +783,29 @@ static jref parse_number(parser *ps)
         ps->p++;
         if (ps->p < ps->end && (*ps->p == '+' || *ps->p == '-'))
             ps->p++;
+        if (ps->p >= ps->end || *ps->p < '0' || *ps->p > '9') {
+            perr(ps, "bad number");
+            return JNULL;
+        }
         while (ps->p < ps->end && *ps->p >= '0' && *ps->p <= '9')
             ps->p++;
     }
-    if (ps->p == start) {
-        perr(ps, "expected value");
+    char tmp[512];
+    size_t n = (size_t)(ps->p - start);
+    if (n >= sizeof tmp) {
+        perr(ps, "number too long");
         return JNULL;
     }
-    char tmp[64];
-    size_t n = (size_t)(ps->p - start);
-    if (n >= sizeof tmp)
-        n = sizeof tmp - 1;
     memcpy(tmp, start, n);
     tmp[n] = '\0';
     if (!real) {
         char *endp = NULL;
+        errno = 0;
         long long i = strtoll(tmp, &endp, 10);
-        if (endp && *endp == '\0')
+        if (endp && *endp == '\0' && errno == 0)
             return jint(ps->d, i);
+        /* An integer that does not fit 64 bits keeps its value as a real. */
+        errno = 0;
     }
     return jreal(ps->d, strtod(tmp, NULL));
 }
@@ -774,7 +828,8 @@ static jref parse_container(parser *ps, bool obj)
         skip_ws(ps);
         uint32_t k = 0;
         if (obj) {
-            if (!parse_string(ps, &k))
+            size_t klen = 0;
+            if (!parse_string(ps, &k, &klen))
                 return JNULL;
             skip_ws(ps);
             if (ps->p >= ps->end || *ps->p != ':') {
@@ -822,12 +877,15 @@ static jref parse_into(parser *ps)
         v = parse_container(ps, c == '{');
     } else if (c == '"') {
         uint32_t h = 0;
-        if (parse_string(ps, &h)) {
+        size_t slen = 0;
+        if (parse_string(ps, &h, &slen)) {
             v = node_new(ps->d, J_STR);
-            if (v == JNULL)
+            if (v == JNULL) {
                 perr(ps, "request too large");
-            else
+            } else {
                 ps->d->nodes[v].a = h;
+                ps->d->nodes[v].n = (uint32_t)slen;
+            }
         }
     } else if (c == 't' && ps->end - ps->p >= 4 && memcmp(ps->p, "true", 4) == 0) {
         ps->p += 4;
@@ -880,8 +938,15 @@ static void dump_into(sbuf *b, const jdoc *d, jref v, int depth)
     case J_BOOL: sb_put(b, jbool_of(d, v) ? "true" : "false"); return;
     case J_INT: sb_printf(b, "%" PRId64, d->nodes[v].num); return;
     case J_REAL: {
+        double x = jnum_of(d, v);
+        if (!isfinite(x)) {
+            /* JSON has no infinity and no NaN, and a client must be able to
+             * parse every line this server writes. */
+            sb_put(b, "null");
+            return;
+        }
         char tmp[40];
-        snprintf(tmp, sizeof tmp, "%.17g", jnum_of(d, v));
+        snprintf(tmp, sizeof tmp, "%.17g", x);
         sb_put(b, tmp);
         return;
     }

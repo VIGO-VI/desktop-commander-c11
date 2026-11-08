@@ -3,6 +3,7 @@
  */
 #include "../src/json.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -227,6 +228,57 @@ static void test_json_escape_utf8(void)
     sb_free(&b);
 }
 
+/* The grammar of RFC 8259 is strict, and a number keeps all its digits. */
+static void test_numbers_strict(void)
+{
+    jdoc *d = jdoc_new();
+    static const char *const bad[] = {"01", "1.", "1e", "-", "+1", ".5", "1e+", "00"};
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        jref v = JNULL;
+        const char *err = NULL;
+        CHECK(!json_parse(d, bad[i], strlen(bad[i]), &v, &err));
+        CHECK(err != NULL);
+    }
+    CHECK(jint_of(d, parse(d, "123456789012345678"), 0) == 123456789012345678LL);
+    CHECK(jint_of(d, parse(d, "-0"), 1) == 0);
+    CHECK(jnum_of(d, parse(d, "1e400")) > 1e308); /* an infinity, kept as one */
+    jdoc_free(d);
+}
+
+/* No answer may hold a byte sequence a client cannot parse: JSON has no
+ * infinity and no NaN, so they leave as null. */
+static void test_dump_non_finite(void)
+{
+    jdoc *d = jdoc_new();
+    sbuf b;
+    sb_init(&b);
+    json_dump_into(&b, d, jreal(d, HUGE_VAL));
+    CHECK(b.p && strcmp(b.p, "null") == 0);
+    sb_reset(&b);
+    json_dump_into(&b, d, jreal(d, NAN));
+    CHECK(b.p && strcmp(b.p, "null") == 0);
+    sb_reset(&b);
+    json_dump_into(&b, d, jreal(d, 1.5));
+    CHECK(b.p && strcmp(b.p, "1.5") == 0);
+    sb_free(&b);
+    jdoc_free(d);
+}
+
+/* A key can be present with a null value, and a string can hold a NUL, which
+ * is why its length is stored beside its bytes. */
+static void test_presence_and_length(void)
+{
+    jdoc *d = jdoc_new();
+    jref o = parse(d, "{\"a\":\"x\\u0000y\",\"n\":null}");
+    CHECK(jhas(d, o, "n"));
+    CHECK(!jhas(d, o, "zz"));
+    size_t n = 0;
+    const char *s = jstrn_of(d, jget(d, o, "a"), &n);
+    CHECK(n == 3 && s[0] == 'x' && s[1] == '\0' && s[2] == 'y');
+    CHECK(jstrn_of(d, jget(d, o, "n"), &n) != NULL && n == 0);
+    jdoc_free(d);
+}
+
 int main(void)
 {
     test_parse_scalars();
@@ -240,6 +292,9 @@ int main(void)
     test_reset();
     test_sbuf();
     test_json_escape_utf8();
+    test_numbers_strict();
+    test_dump_non_finite();
+    test_presence_and_length();
     if (failures) {
         fprintf(stderr, "%d json test(s) failed\n", failures);
         return 1;

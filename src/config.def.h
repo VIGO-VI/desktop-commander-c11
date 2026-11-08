@@ -28,6 +28,11 @@
 /* Shell for start_process. "" takes $SHELL, then /bin/bash. */
 #define DCM_DEFAULT_SHELL ""
 
+/* Largest file a tool reads as a whole: an image, a multiple-file read or the
+ * file edit_block rewrites. read_file itself streams its window, so a 20 GB
+ * log costs the lines it returns and not the log. */
+#define DCM_MAX_FILE_BYTES (64u * 1024 * 1024)
+
 /* Default length of read_file, and the line count edit_block warns above. */
 #define DCM_READ_LINE_LIMIT 1000
 #define DCM_WRITE_LINE_LIMIT 50

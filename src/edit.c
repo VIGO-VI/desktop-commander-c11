@@ -4,6 +4,7 @@
  * edit_block: exact search/replace with an expected count, and a report of
  * the closest text when the search string is absent.
  */
+#include "config.h"
 #include "tools.h"
 #include "util.h"
 
@@ -16,6 +17,16 @@
 static bool has_crlf(const char *s)
 {
     return strstr(s, "\r\n") != NULL;
+}
+
+/* The mode of the file about to be replaced, so a rewrite keeps it. A file
+ * that is not there gets the usual 0644. */
+static mode_t keep_mode(const char *path)
+{
+    struct stat st;
+    if (stat(path, &st) == 0 && S_ISREG(st.st_mode))
+        return st.st_mode & 07777;
+    return 0644;
 }
 
 /* Make a string use CRLF (crlf) or LF. */
@@ -144,7 +155,7 @@ tool_result tool_edit_block(jdoc *d, jref a)
     }
 
     size_t len = 0;
-    char *content = read_file_all(abs, &len, &err);
+    char *content = read_file_max(abs, DCM_MAX_FILE_BYTES, &len, &err);
     if (!content) {
         tool_result r = result_error(d, "%s", err);
         free(err);
@@ -206,7 +217,7 @@ tool_result tool_edit_block(jdoc *d, jref a)
         return r;
     }
 
-    char *out = write_file_atomic(abs, updated, strlen(updated), false, 0644, &err);
+    char *out = write_file_atomic(abs, updated, strlen(updated), false, keep_mode(abs), &err);
     if (!out) {
         tool_result r = result_error(d, "%s", err);
         free(err);
@@ -243,6 +254,24 @@ tool_result tool_edit_block(jdoc *d, jref a)
         sb_printf(&b, "[Reading %zu lines from line %zu (total: %zu lines, %zu remaining)]\n\n",
                   shown, first, total, remaining);
     sb_put(&b, preview);
+
+    /* The same warning the original gives above its line limit. */
+    int64_t wlimit = cfg()->write_line_limit;
+    if (wlimit > 0) {
+        int64_t slines = 1, rlines = 1;
+        for (const char *p = search; *p; p++)
+            slines += *p == '\n';
+        for (const char *p = replace; *p; p++)
+            rlines += *p == '\n';
+        int64_t most = slines > rlines ? slines : rlines;
+        if (most > wlimit)
+            sb_printf(&b,
+                      "\n\nWARNING: The %s has %lld lines (maximum: %lld)."
+                      "\n\nRECOMMENDATION: For large search/replace operations, consider "
+                      "breaking them into smaller chunks with fewer lines.",
+                      slines > rlines ? "search text" : "replacement text", (long long)most,
+                      (long long)wlimit);
+    }
 
     tool_result r = result_buf(d, &b);
     free(preview);

@@ -84,6 +84,7 @@ check: $(BIN) tests/test_json tests/test_util
 	@if command -v python3 >/dev/null 2>&1; then \
 		python3 tests/test_pool.py ./$(BIN); \
 		python3 tests/test_process.py ./$(BIN); \
+		python3 tests/test_protocol.py ./$(BIN); \
 		python3 tests/conformance.py --binary ./$(BIN); \
 	else \
 		echo "skip: python3 not found, the pool, process and conformance tests did not run"; \
